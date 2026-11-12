@@ -1,0 +1,31 @@
+{
+  "summary": "Activar servicios Kie Suno con precio 2× y verificación de firma",
+  "todos": [
+    {
+      "id": 1,
+      "description": "Base de datos: precios, tareas Kie, personas de voz, stems avanzados",
+      "files": [],
+      "status": "complete"
+    },
+    {
+      "id": 2,
+      "description": "Backend: servicios Kie, cobro/reembolso y webhook firmado",
+      "files": [],
+      "status": "complete"
+    },
+    {
+      "id": 3,
+      "description": "Interfaz: herramientas IA por canción, subir audio, stems avanzados, personas",
+      "files": [],
+      "status": "complete"
+    },
+    {
+      "id": 4,
+      "description": "Despliegue, verificación y clave del webhook",
+      "files": [],
+      "status": "active"
+    }
+  ],
+  "createdAt": "2026-11-12T03:58:50.764Z",
+  "updatedAt": "2026-11-12T04:12:00.635Z"
+}

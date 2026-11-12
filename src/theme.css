@@ -1,0 +1,38 @@
+/**
+ * ⚠️ THEME CONFIGURATION — Tailwind v4
+ * Dark "neon studio" identity for the music platform.
+ */
+@theme {
+	/* Core surfaces */
+	--color-background: #08080a;
+	--color-foreground: #f4f4f5;
+	--color-surface: #121216;
+	--color-surface-2: #1b1b21;
+	--color-surface-3: #26262e;
+
+	/* Brand */
+	--color-primary: #c8f73c;
+	--color-primary-foreground: #0a0a0b;
+
+	--color-secondary: #1b1b21;
+	--color-secondary-foreground: #f4f4f5;
+
+	--color-destructive: #f43f5e;
+	--color-destructive-foreground: #ffffff;
+
+	--color-muted: #1b1b21;
+	--color-muted-foreground: #9b9ba6;
+
+	--color-accent: #7cf0d8;
+	--color-accent-foreground: #0a0a0b;
+
+	--color-border: #27272e;
+	--color-input: #27272e;
+	--color-ring: #c8f73c;
+
+	/* Radius */
+	--radius-sm: 0.5rem;
+	--radius-md: 0.75rem;
+	--radius-lg: 1rem;
+	--radius-xl: 1.5rem;
+}
