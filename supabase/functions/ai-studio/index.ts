@@ -49,6 +49,8 @@ async function priceOf(admin: SupabaseClient, service: string): Promise<{ cost: 
 const PLAN_ERROR = 'This tool is included in the Pro, Artista and Empresa plans. Upgrade your plan to use it.';
 const MAX_ACTIVE = 5;
 const MAX_PER_HOUR = 30;
+const MAX_ACTIVE_MODAL = 24;
+const MAX_PER_HOUR_MODAL = 300;
 
 /** The user's plan slug (active or trialing subscription); everyone else is on "gratis". */
 async function planSlugOf(admin: SupabaseClient, userId: string): Promise<string> {
@@ -63,15 +65,26 @@ async function planAllows(admin: SupabaseClient, userId: string, plans: string[]
 	return plans.includes(await planSlugOf(admin, userId));
 }
 
-/** Per-user request limits for paid AI jobs: at most MAX_ACTIVE running and MAX_PER_HOUR started in the last hour. */
-async function rateLimitError(admin: SupabaseClient, userId: string): Promise<string | null> {
+/** Per-user request limits: Modal GPU jobs have generous limits so storyboards don't hit the 30/hr third-party cap. */
+async function rateLimitError(admin: SupabaseClient, userId: string, providerSlug?: string): Promise<string | null> {
 	const hourAgo = new Date(Date.now() - 3_600_000).toISOString();
 	const count = async (q: PromiseLike<{ count: number | null }>) => (await q).count ?? 0;
+
+	if (providerSlug?.startsWith('modal-')) {
+		const [activeModal, hourModal] = await Promise.all([
+			count(admin.from('ai_creations').select('id', { count: 'exact', head: true }).eq('user_id', userId).like('provider_slug', 'modal-%').in('status', ['queued', 'generating'])),
+			count(admin.from('ai_creations').select('id', { count: 'exact', head: true }).eq('user_id', userId).like('provider_slug', 'modal-%').gte('created_at', hourAgo)),
+		]);
+		if (activeModal >= MAX_ACTIVE_MODAL) return 'You already have 24 Modal GPU tasks in progress. Wait a moment for one to finish.';
+		if (hourModal >= MAX_PER_HOUR_MODAL) return 'You reached the hourly Modal safety limit (300/hr). Try again in a few minutes.';
+		return null;
+	}
+
 	const [a1, a2, a3, h1, h2, h3] = await Promise.all([
-		count(admin.from('ai_creations').select('id', { count: 'exact', head: true }).eq('user_id', userId).in('status', ['queued', 'generating'])),
+		count(admin.from('ai_creations').select('id', { count: 'exact', head: true }).eq('user_id', userId).not('provider_slug', 'like', 'modal-%').in('status', ['queued', 'generating'])),
 		count(admin.from('ai_stems').select('id', { count: 'exact', head: true }).eq('user_id', userId).eq('status', 'generating')),
 		count(admin.from('kie_tasks').select('id', { count: 'exact', head: true }).eq('user_id', userId).eq('status', 'generating')),
-		count(admin.from('ai_creations').select('id', { count: 'exact', head: true }).eq('user_id', userId).gte('created_at', hourAgo)),
+		count(admin.from('ai_creations').select('id', { count: 'exact', head: true }).eq('user_id', userId).not('provider_slug', 'like', 'modal-%').gte('created_at', hourAgo)),
 		count(admin.from('ai_stems').select('id', { count: 'exact', head: true }).eq('user_id', userId).gte('created_at', hourAgo)),
 		count(admin.from('kie_tasks').select('id', { count: 'exact', head: true }).eq('user_id', userId).gte('created_at', hourAgo)),
 	]);
@@ -806,7 +819,7 @@ Deno.serve(async (req) => {
 			const apiKey = provider.secret_name ? Deno.env.get(provider.secret_name) : undefined;
 			if (!apiKey) return json({ error: `${provider.name} todavía no tiene su clave de API configurada` }, 400);
 
-			const limited = await rateLimitError(admin, user.id);
+			const limited = await rateLimitError(admin, user.id, provider.slug);
 			if (limited) return json({ error: limited }, 429);
 			const cost = provider.credit_cost;
 			const { data: bal } = await admin.from('credit_balances').select('balance').eq('user_id', user.id).maybeSingle();

@@ -147,7 +147,8 @@ function drawVisualClip(
 			video.loop = true;
 			const srcDur = Number.isFinite(video.duration) && video.duration > 0.4 ? video.duration : clip.duration;
 			const desired = (clip.trimStart + localT * clip.speed) % Math.max(0.5, srcDur);
-			if (!video.seeking && Math.abs(video.currentTime - desired) > 0.9 && video.readyState >= 2) {
+			// Seek only at the very start of the clip if out of phase, never thrash mid-playback
+			if (localT < 0.06 && !video.seeking && video.readyState >= 2 && Math.abs(video.currentTime - desired) > 0.25) {
 				try {
 					video.currentTime = desired;
 				} catch {

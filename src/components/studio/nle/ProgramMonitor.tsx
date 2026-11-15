@@ -50,6 +50,21 @@ function activeClipInTrack(track: NleTrack, t: number): NleClip | null {
 	return null;
 }
 
+function findPreviousClipInTrack(track: NleTrack, current: NleClip): NleClip | null {
+	return (
+		track.clips
+			.filter((c) => c.id !== current.id && c.startTime < current.startTime)
+			.sort((a, b) => b.startTime + b.duration - (a.startTime + a.duration))[0] ?? null
+	);
+}
+
+function findUpcomingClipsInTrack(track: NleTrack, t: number, count = 2): NleClip[] {
+	return track.clips
+		.filter((c) => c.startTime > t && c.startTime - t <= 8)
+		.sort((a, b) => a.startTime - b.startTime)
+		.slice(0, count);
+}
+
 function getMotionTransform(clip: NleClip, t: number): string {
 	const ratio = Math.max(0, Math.min(1, (t - clip.startTime) / Math.max(0.1, clip.duration)));
 	if (clip.cameraMotion === 'zoom-in') {
@@ -67,23 +82,16 @@ function getMotionTransform(clip: NleClip, t: number): string {
 	return 'translate3d(0, 0, 0) scale(1)';
 }
 
-function getTransitionOpacity(clip: NleClip, t: number): number {
+function getTransitionOpacity(clip: NleClip, t: number, hasOutgoingUnderlay: boolean): number {
 	const localT = Math.max(0, t - clip.startTime);
-	const transDur = Math.min(0.45, clip.duration * 0.18);
-	if (
-		(clip.transitionIn === 'cross-dissolve' || clip.transitionIn === 'fade-black') &&
-		transDur > 0.05 &&
-		localT < transDur
-	) {
-		return clip.opacity * Math.max(0.15, localT / transDur);
+	const transDur = Math.min(0.35, clip.duration * 0.22);
+	if (clip.transitionIn === 'fade-black' && transDur > 0.05 && localT < transDur) {
+		return clip.opacity * Math.max(0, localT / transDur);
+	}
+	if (clip.transitionIn === 'cross-dissolve' && hasOutgoingUnderlay && transDur > 0.05 && localT < transDur) {
+		return clip.opacity * Math.max(0, localT / transDur);
 	}
 	return clip.opacity;
-}
-
-function wrappedDistance(a: number, b: number, period: number): number {
-	if (!Number.isFinite(period) || period <= 0.2) return Math.abs(a - b);
-	const d = Math.abs((a % period) - (b % period));
-	return Math.min(d, period - d);
 }
 
 function VisualLayer({
@@ -95,6 +103,8 @@ function VisualLayer({
 	trackMuted,
 	trackVolume,
 	seekVersion,
+	mode,
+	hasOutgoingUnderlay,
 }: {
 	clip: NleClip;
 	fx: NleProjectFx;
@@ -104,77 +114,130 @@ function VisualLayer({
 	trackMuted: boolean;
 	trackVolume: number;
 	seekVersion: number;
+	mode: 'active' | 'outgoing' | 'preload';
+	hasOutgoingUnderlay: boolean;
 }) {
 	const videoRef = useRef<HTMLVideoElement | null>(null);
 	const lastSeekVersionRef = useRef(seekVersion);
+	const prevModeRef = useRef<string>(mode);
+	const needsInitialSyncRef = useRef<boolean>(true);
 	const effLut = clip.lutId !== 'inherit' ? clip.lutId : fx.lutId;
 	const filter = buildCssFilter(effLut, clip.colorAdjust);
-	const transform = getMotionTransform(clip, playhead);
-	const opacity = getTransitionOpacity(clip, playhead);
+
+	const clampedTime =
+		mode === 'outgoing'
+			? clip.startTime + clip.duration
+			: mode === 'preload'
+			? clip.startTime
+			: playhead;
+	const transform = getMotionTransform(clip, clampedTime);
+	const opacity =
+		mode === 'preload'
+			? 0
+			: mode === 'outgoing'
+			? clip.opacity
+			: getTransitionOpacity(clip, playhead, hasOutgoingUnderlay);
 
 	useEffect(() => {
 		const vid = videoRef.current;
 		if (!vid || clip.type !== 'video') return;
-		vid.muted = masterMuted || trackMuted || clip.volume === 0;
+		vid.muted = mode === 'preload' || masterMuted || trackMuted || clip.volume === 0;
 		vid.volume = Math.max(0, Math.min(1, clip.volume * trackVolume));
 		vid.playbackRate = clip.speed;
 		vid.loop = true;
 
-		const rawOffset = Math.max(0, clip.trimStart + (playhead - clip.startTime) * clip.speed);
-		const dur = Number.isFinite(vid.duration) && vid.duration > 0.4 ? vid.duration : 0;
-		const srcTarget = dur > 0 ? rawOffset % dur : rawOffset;
 		const userSeeked = lastSeekVersionRef.current !== seekVersion;
 		lastSeekVersionRef.current = seekVersion;
+		const justBecameActive = prevModeRef.current !== 'active' && mode === 'active';
+		prevModeRef.current = mode;
 
-		// Only seek on manual scrub, when paused, or if playback drifted past threshold (never thrash mid-buffer)
-		const drift = dur > 0 ? wrappedDistance(vid.currentTime, srcTarget, dur) : Math.abs(vid.currentTime - srcTarget);
-		if (!vid.seeking && vid.readyState >= 1 && (userSeeked || !isPlaying || drift > 0.9)) {
-			if (Math.abs(vid.currentTime - srcTarget) > 0.12) {
+		if (userSeeked || justBecameActive) {
+			needsInitialSyncRef.current = true;
+		}
+
+		if (mode === 'preload') {
+			if (!vid.paused) vid.pause();
+			if (!vid.seeking && vid.readyState >= 1 && Math.abs(vid.currentTime - clip.trimStart) > 0.08) {
+				try {
+					vid.currentTime = clip.trimStart;
+				} catch {
+					// ignore before metadata
+				}
+			}
+			return;
+		}
+
+		const rawOffset = Math.max(0, clip.trimStart + (clampedTime - clip.startTime) * clip.speed);
+		const dur = Number.isFinite(vid.duration) && vid.duration > 0.4 ? vid.duration : 0;
+		const srcTarget = dur > 0 ? rawOffset % dur : rawOffset;
+
+		// Seek ONLY when paused, user explicitly scrubbed, or on first activation before playback settles.
+		// Never re-seek mid-playback: re-seeking is what causes black decoder flashes!
+		const shouldSyncTime = !isPlaying || userSeeked || needsInitialSyncRef.current;
+
+		if (shouldSyncTime && !vid.seeking && vid.readyState >= 1) {
+			if (Math.abs(vid.currentTime - srcTarget) > 0.08) {
 				try {
 					vid.currentTime = srcTarget;
 				} catch {
 					// ignore until metadata loads
 				}
 			}
+			needsInitialSyncRef.current = false;
 		}
 
-		if (isPlaying && vid.paused) {
+		if (mode === 'active' && isPlaying && vid.paused) {
 			void vid.play().catch(() => undefined);
-		} else if (!isPlaying && !vid.paused) {
+		} else if ((!isPlaying || mode === 'outgoing') && !vid.paused) {
 			vid.pause();
 		}
-	}, [clip, playhead, isPlaying, masterMuted, trackMuted, trackVolume, seekVersion]);
+	}, [clip, clampedTime, isPlaying, masterMuted, trackMuted, trackVolume, seekVersion, mode]);
+
+	const zClass = mode === 'preload' ? 'z-0 pointer-events-none' : mode === 'outgoing' ? 'z-[1]' : 'z-[2]';
+	const filterStyle = filter !== 'none' ? filter : undefined;
 
 	if (clip.type === 'video' && clip.sourceUrl) {
 		return (
-			<video
-				ref={videoRef}
-				src={clip.sourceUrl}
-				loop
-				playsInline
-				preload="auto"
-				style={{
-					opacity,
-					filter: filter !== 'none' ? filter : undefined,
-					transform,
-				}}
-				className="absolute inset-0 h-full w-full object-cover will-change-transform"
-			/>
+			<div
+				aria-hidden={mode === 'preload'}
+				style={{ opacity }}
+				className={`absolute inset-0 h-full w-full overflow-hidden ${zClass}`}
+			>
+				{clip.thumbnailUrl && (
+					<img
+						src={clip.thumbnailUrl}
+						alt=""
+						decoding="async"
+						style={{ filter: filterStyle, transform }}
+						className="absolute inset-0 h-full w-full object-cover will-change-transform"
+					/>
+				)}
+				<video
+					ref={videoRef}
+					src={clip.sourceUrl}
+					loop
+					playsInline
+					preload="auto"
+					style={{ filter: filterStyle, transform }}
+					className="absolute inset-0 h-full w-full object-cover will-change-transform"
+				/>
+			</div>
 		);
 	}
 
 	if (clip.sourceUrl) {
 		return (
 			<img
+				aria-hidden={mode === 'preload'}
 				src={clip.sourceUrl}
-				alt={clip.title}
+				alt={mode === 'preload' ? '' : clip.title}
 				decoding="async"
 				style={{
 					opacity,
-					filter: filter !== 'none' ? filter : undefined,
+					filter: filterStyle,
 					transform,
 				}}
-				className="absolute inset-0 h-full w-full object-cover will-change-transform"
+				className={`absolute inset-0 h-full w-full object-cover will-change-transform ${zClass}`}
 			/>
 		);
 	}
@@ -202,13 +265,64 @@ export function ProgramMonitor({
 	const tracksRef = useRef(tracks);
 	tracksRef.current = tracks;
 
-	const visualLayers = useMemo(() => {
-		return tracks
+	const { visualLayers, activeHeadlineClip } = useMemo(() => {
+		const layers: {
+			key: string;
+			track: NleTrack;
+			clip: NleClip;
+			mode: 'active' | 'outgoing' | 'preload';
+			hasOutgoingUnderlay: boolean;
+		}[] = [];
+		let topActive: NleClip | null = null;
+
+		const visibleVideoTracks = tracks
 			.filter((t) => t.kind === 'video' && !t.hidden)
 			.slice()
-			.reverse()
-			.map((t) => ({ track: t, clip: activeClipInTrack(t, playhead) }))
-			.filter((x): x is { track: NleTrack; clip: NleClip } => Boolean(x.clip));
+			.reverse();
+
+		for (const track of visibleVideoTracks) {
+			const active = activeClipInTrack(track, playhead);
+			if (active) {
+				topActive = active;
+				const localT = Math.max(0, playhead - active.startTime);
+				const transDur = Math.min(0.35, active.duration * 0.22);
+				const prevClip =
+					active.transitionIn === 'cross-dissolve' && localT < transDur
+						? findPreviousClipInTrack(track, active)
+						: null;
+
+				if (prevClip) {
+					layers.push({
+						key: `${track.id}-${prevClip.id}`,
+						track,
+						clip: prevClip,
+						mode: 'outgoing',
+						hasOutgoingUnderlay: false,
+					});
+				}
+				layers.push({
+					key: `${track.id}-${active.id}`,
+					track,
+					clip: active,
+					mode: 'active',
+					hasOutgoingUnderlay: Boolean(prevClip),
+				});
+			}
+
+			const upcoming = findUpcomingClipsInTrack(track, playhead, 2);
+			for (const up of upcoming) {
+				if (layers.some((l) => l.key === `${track.id}-${up.id}`)) continue;
+				layers.push({
+					key: `${track.id}-${up.id}`,
+					track,
+					clip: up,
+					mode: 'preload',
+					hasOutgoingUnderlay: false,
+				});
+			}
+		}
+
+		return { visualLayers: layers, activeHeadlineClip: topActive };
 	}, [tracks, playhead]);
 
 	const activeTexts = useMemo(() => {
@@ -324,7 +438,7 @@ export function ProgramMonitor({
 						Monitor de Programa
 					</span>
 					<span className="truncate text-[11px] text-foreground/80">
-						{visualLayers[visualLayers.length - 1]?.clip.title ?? 'Sin clip en cabezal'}
+						{activeHeadlineClip?.title ?? 'Sin clip en cabezal'}
 					</span>
 				</div>
 				<span className="font-mono text-[11px] tabular-nums text-cyan-400">
@@ -338,26 +452,27 @@ export function ProgramMonitor({
 					onClick={onTogglePlay}
 					className={`relative flex items-center justify-center overflow-hidden rounded-md bg-black border border-white/10 shadow-2xl cursor-pointer ${aspectBoxClass}`}
 				>
-					{visualLayers.length === 0 ? (
-						<div className="flex flex-col items-center justify-center text-center p-4 text-xs text-muted-foreground">
+					{!visualLayers.some((l) => l.mode === 'active') && (
+						<div className="relative z-[3] flex flex-col items-center justify-center text-center p-4 text-xs text-muted-foreground">
 							<Play className="h-7 w-7 mb-1.5 opacity-40" />
 							<span>Coloca clips en V1 o genera escenas IA</span>
 						</div>
-					) : (
-						visualLayers.map(({ track, clip }) => (
-							<VisualLayer
-								key={clip.id}
-								clip={clip}
-								fx={fx}
-								playhead={playhead}
-								isPlaying={isPlaying}
-								masterMuted={masterMuted}
-								trackMuted={track.muted}
-								trackVolume={track.volume}
-								seekVersion={seekVersion}
-							/>
-						))
 					)}
+					{visualLayers.map(({ key, track, clip, mode, hasOutgoingUnderlay }) => (
+						<VisualLayer
+							key={key}
+							clip={clip}
+							fx={fx}
+							playhead={playhead}
+							isPlaying={isPlaying}
+							masterMuted={masterMuted}
+							trackMuted={track.muted}
+							trackVolume={track.volume}
+							seekVersion={seekVersion}
+							mode={mode}
+							hasOutgoingUnderlay={hasOutgoingUnderlay}
+						/>
+					))}
 
 					{/* GPU-composited Cinema Overlays */}
 					{fx.lightLeak && (

@@ -32,6 +32,11 @@ import {
 } from '@/lib/studio';
 import { primaryButton } from '@/lib/ui';
 import {
+	analyzeAudioTrack,
+	buildMusicalCutGrid,
+	type MusicalCutSlot,
+} from '@/lib/nle/audioAnalyzer';
+import {
 	computeTimelineDuration,
 	createInitialTracksFromSong,
 	deleteClipFromTracks,
@@ -593,30 +598,108 @@ export function NleEditorShell({
 		});
 	}
 
-	function handleAssembleMaestroPlan(plan: MaestroPlan) {
-		setProjectTitle(plan.title);
+	function buildBeatCutClipsFromSources(
+		sources: {
+			title: string;
+			type: 'video' | 'image';
+			sourceUrl: string;
+			thumbnailUrl?: string;
+			startTime: number;
+			endTime: number;
+			aiPrompt?: string;
+		}[],
+		slots: MusicalCutSlot[]
+	): NleClip[] {
+		if (sources.length === 0 || slots.length === 0) return [];
+		const uniquePool: typeof sources = [];
+		const seenUrls = new Set<string>();
+		for (const s of sources) {
+			if (!s.sourceUrl || seenUrls.has(s.sourceUrl)) continue;
+			seenUrls.add(s.sourceUrl);
+			uniquePool.push(s);
+		}
+		if (uniquePool.length === 0) return [];
 
-		const visualClips: NleClip[] = plan.scenes
-			.filter((sc) => Boolean(sc.videoUrl || sc.imageUrl))
-			.map((sc) => ({
-				id: makeClipId(sc.videoUrl ? 'vid' : 'img'),
+		const motions: NleClip['cameraMotion'][] = ['zoom-in', 'pan-right', 'zoom-out', 'pan-left'];
+		const maxEnd = Math.max(1, sources[sources.length - 1]?.endTime ?? 45);
+		let lastUrl = '';
+
+		return slots.map((slot) => {
+			const mid = (slot.startTime + slot.endTime) / 2;
+			let primaryIdx = sources.findIndex((s) => mid >= s.startTime && mid <= s.endTime);
+			if (primaryIdx < 0) {
+				primaryIdx = Math.min(sources.length - 1, Math.floor((mid / maxEnd) * sources.length));
+			}
+			const primary = sources[primaryIdx] ?? uniquePool[0];
+			const primaryPoolIdx = Math.max(
+				0,
+				uniquePool.findIndex((u) => u.sourceUrl === primary.sourceUrl)
+			);
+
+			let chosen =
+				slot.cutIndex % 2 === 0
+					? primary
+					: uniquePool[(primaryPoolIdx + 1 + Math.floor(slot.cutIndex / 2)) % uniquePool.length];
+
+			if (chosen.sourceUrl === lastUrl && uniquePool.length > 1) {
+				const curIdx = Math.max(
+					0,
+					uniquePool.findIndex((u) => u.sourceUrl === chosen.sourceUrl)
+				);
+				chosen = uniquePool[(curIdx + 1) % uniquePool.length];
+			}
+			lastUrl = chosen.sourceUrl;
+
+			const cleanTitle = chosen.title.replace(/\s*·\s*C\d+$/i, '');
+			const safeTrimStart =
+				chosen.type === 'video' && slot.duration <= 1.75 && slot.cutIndex % 4 >= 2 ? 0.25 : 0;
+
+			return {
+				id: makeClipId(chosen.type === 'video' ? 'vid' : 'img'),
 				trackId: 'track-v1',
-				type: sc.videoUrl ? 'video' : 'image',
-				title: sc.title,
-				sourceUrl: sc.videoUrl || sc.imageUrl,
-				thumbnailUrl: sc.imageUrl,
-				startTime: sc.startTime,
-				duration: sc.duration,
-				trimStart: 0,
+				type: chosen.type,
+				title: `${cleanTitle} · C${slot.cutIndex + 1}`,
+				sourceUrl: chosen.sourceUrl,
+				thumbnailUrl: chosen.thumbnailUrl,
+				startTime: slot.startTime,
+				duration: slot.duration,
+				trimStart: safeTrimStart,
 				opacity: 1,
 				speed: 1,
 				volume: 0,
 				lutId: 'inherit',
 				colorAdjust: { ...DEFAULT_COLOR_ADJUST },
-				cameraMotion: sc.cameraMotion,
-				transitionIn: sc.sceneNumber === 1 ? 'none' : 'cross-dissolve',
+				cameraMotion: motions[slot.cutIndex % motions.length],
+				transitionIn: slot.isVocalEntryBoundary ? 'cross-dissolve' : 'none',
+				aiPrompt: chosen.aiPrompt,
+			};
+		});
+	}
+
+	function handleAssembleMaestroPlan(plan: MaestroPlan) {
+		setProjectTitle(plan.title);
+
+		const sceneSources = plan.scenes
+			.filter((sc) => Boolean(sc.videoUrl || sc.imageUrl))
+			.map((sc) => ({
+				title: sc.title,
+				type: (sc.videoUrl ? 'video' : 'image') as 'video' | 'image',
+				sourceUrl: sc.videoUrl || sc.imageUrl,
+				thumbnailUrl: sc.imageUrl,
+				startTime: sc.startTime,
+				endTime: sc.endTime,
 				aiPrompt: sc.visualPrompt,
 			}));
+
+		const beatSlots = buildMusicalCutGrid({
+			duration: plan.analysis.duration,
+			bpm: plan.analysis.estimatedBpm,
+			vocalEntryTime: plan.analysis.vocalEntryTime,
+			peakHookStart: plan.analysis.peakHookStart,
+			peakHookEnd: plan.analysis.peakHookEnd,
+		});
+
+		const visualClips = buildBeatCutClipsFromSources(sceneSources, beatSlots);
 
 		const vocalEntry = plan.analysis.vocalEntryTime ?? 0;
 		const textClips: NleClip[] = plan.scenes
@@ -689,6 +772,59 @@ export function NleEditorShell({
 		setSeekVersion((v) => v + 1);
 		setIsPlaying(false);
 		setSelectedClipId(visualClips[0]?.id ?? null);
+	}
+
+	async function handleBeatCutTimeline() {
+		const v1Track = tracks.find((t) => t.id === 'track-v1') ?? tracks.find((t) => t.kind === 'video');
+		const existingVisuals = (v1Track?.clips ?? [])
+			.filter((c) => Boolean(c.sourceUrl))
+			.slice()
+			.sort((a, b) => a.startTime - b.startTime);
+
+		if (existingVisuals.length === 0) return;
+
+		const a1Clip = tracks.find((t) => t.id === 'track-a1')?.clips[0];
+		const songMatch =
+			songs.find((s) => s.audioUrl === a1Clip?.sourceUrl) ??
+			(a1Clip ? null : initialSong ?? songs[0] ?? null);
+		const audioUrl = a1Clip?.sourceUrl || songMatch?.audioUrl || '';
+		const targetDur = Math.max(
+			4,
+			a1Clip?.duration ||
+				existingVisuals.reduce((mx, c) => Math.max(mx, c.startTime + c.duration), 0) ||
+				totalDuration
+		);
+
+		const analysis = await analyzeAudioTrack(audioUrl, targetDur, songMatch?.lyrics);
+		const slots = buildMusicalCutGrid({
+			duration: targetDur,
+			bpm: analysis.estimatedBpm,
+			vocalEntryTime: analysis.vocalEntryTime,
+			peakHookStart: analysis.peakHookStart,
+			peakHookEnd: analysis.peakHookEnd,
+		});
+
+		const sources = existingVisuals.map((c) => ({
+			title: c.title,
+			type: (c.type === 'video' ? 'video' : 'image') as 'video' | 'image',
+			sourceUrl: c.sourceUrl,
+			thumbnailUrl: c.thumbnailUrl,
+			startTime: c.startTime,
+			endTime: c.startTime + c.duration,
+			aiPrompt: c.aiPrompt,
+		}));
+
+		const beatClips = buildBeatCutClipsFromSources(sources, slots);
+		if (beatClips.length === 0) return;
+
+		setTracks((prev) =>
+			prev.map((tr) =>
+				tr.id === (v1Track?.id ?? 'track-v1') ? { ...tr, clips: beatClips } : tr
+			)
+		);
+		setSelectedClipId(beatClips[0]?.id ?? null);
+		setPlayhead(0);
+		setSeekVersion((v) => v + 1);
 	}
 
 	async function handleMagicDetectTitles() {
@@ -980,6 +1116,7 @@ export function NleEditorShell({
 				onDeleteSelected={handleDeleteSelected}
 				onAddTrack={handleAddTrack}
 				onAutoBuildFromSong={(song) => openMaestroForSong(song?.key)}
+				onBeatCutTimeline={handleBeatCutTimeline}
 			/>
 
 			<MaestroDirectorModal

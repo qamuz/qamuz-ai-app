@@ -16,6 +16,7 @@ import {
 	Volume2,
 	VolumeX,
 	Wand2,
+	Zap,
 	ZoomIn,
 	ZoomOut,
 } from 'lucide-react';
@@ -41,6 +42,7 @@ interface Props {
 	onDeleteSelected: () => void;
 	onAddTrack: (kind: 'video' | 'audio') => void;
 	onAutoBuildFromSong: (song: StudioSong) => void;
+	onBeatCutTimeline?: () => void | Promise<void>;
 }
 
 type DragState =
@@ -74,11 +76,16 @@ export function NleTimeline({
 	onDeleteSelected,
 	onAddTrack,
 	onAutoBuildFromSong,
+	onBeatCutTimeline,
 }: Props) {
 	const [pxPerSec, setPxPerSec] = useState(22);
 	const [snapEnabled, setSnapEnabled] = useState(true);
 	const [dragState, setDragState] = useState<DragState>(null);
+	const [beatCutting, setBeatCutting] = useState(false);
 	const scrollContainerRef = useRef<HTMLDivElement | null>(null);
+	const hasVisualClips = tracks.some(
+		(tr) => tr.kind === 'video' && tr.clips.some((c) => Boolean(c.sourceUrl))
+	);
 
 	const timelineWidth = Math.max(760, Math.ceil((totalDuration + 10) * pxPerSec));
 
@@ -262,8 +269,30 @@ export function NleTimeline({
 					</button>
 				</div>
 
-				{/* Right Toolbar: Auto Storyboard + Snap + Zoom */}
+				{/* Right Toolbar: Beat-Cut 1-2s + Auto Storyboard + Snap + Zoom */}
 				<div className="flex items-center gap-2">
+					{onBeatCutTimeline && hasVisualClips && (
+						<button
+							type="button"
+							disabled={beatCutting}
+							onClick={async () => {
+								setBeatCutting(true);
+								try {
+									await onBeatCutTimeline();
+								} finally {
+									setBeatCutting(false);
+								}
+							}}
+							title="Cortar tomas de V1 cada 1–2s al ritmo del compás (BPM)"
+							className="inline-flex h-7 items-center gap-1 rounded-md border border-primary/50 bg-primary/15 px-2.5 text-[11px] font-bold text-primary hover:bg-primary hover:text-primary-foreground transition-colors disabled:opacity-50"
+						>
+							<Zap className="h-3 w-3" />
+							<span className="hidden sm:inline">
+								{beatCutting ? 'Sincronizando...' : 'Ritmo 1-2s'}
+							</span>
+						</button>
+					)}
+
 					{songs.length > 0 && (
 						<button
 							type="button"

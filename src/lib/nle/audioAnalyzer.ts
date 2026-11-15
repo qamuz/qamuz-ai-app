@@ -204,3 +204,91 @@ export async function analyzeAudioTrack(
 		detectedLyrics,
 	};
 }
+
+export interface MusicalCutSlot {
+	cutIndex: number;
+	startTime: number;
+	endTime: number;
+	duration: number;
+	isPeak: boolean;
+	isVocalEntryBoundary: boolean;
+}
+
+/**
+ * Generates rhythmic 1.0s - 2.0s cut boundaries locked to the song's BPM/compás,
+ * aligned so a clean cut lands right at vocalEntryTime and tightens during the peak chorus.
+ */
+export function buildMusicalCutGrid(params: {
+	duration: number;
+	bpm: number;
+	vocalEntryTime?: number;
+	peakHookStart?: number;
+	peakHookEnd?: number;
+}): MusicalCutSlot[] {
+	const total = Math.max(4, Number(params.duration) || 45);
+	const safeBpm = Math.max(70, Math.min(180, Number(params.bpm) || 115));
+	const beatSec = 60 / safeBpm;
+
+	// Choose an integer number of beats per cut so verse cuts stay ~1.4s-2.0s
+	// and peak/chorus cuts stay ~1.0s-1.55s (always <= 2.05s to match 25-frame SVD clips cleanly).
+	let verseBeats = 3;
+	while (beatSec * verseBeats < 1.35 && verseBeats < 6) verseBeats++;
+	while (beatSec * verseBeats > 2.05 && verseBeats > 2) verseBeats--;
+	const normalCutSec = Math.max(1.2, Math.min(2.05, Number((beatSec * verseBeats).toFixed(2))));
+
+	let peakBeats = Math.max(2, verseBeats - 1);
+	if (beatSec * peakBeats < 1.0) peakBeats++;
+	const peakCutSec = Math.max(1.0, Math.min(1.6, Number((beatSec * peakBeats).toFixed(2))));
+
+	const vocalEntry =
+		typeof params.vocalEntryTime === 'number' && params.vocalEntryTime > 1.1 && params.vocalEntryTime < total - 1.5
+			? Number(params.vocalEntryTime.toFixed(2))
+			: null;
+	const peakStart = params.peakHookStart ?? total * 0.35;
+	const peakEnd = params.peakHookEnd ?? total * 0.72;
+
+	const rawBoundaries: number[] = [0];
+
+	const pushSectionCuts = (from: number, to: number) => {
+		let cur = from;
+		while (to - cur > 0.25) {
+			const inPeak = cur >= peakStart - 0.1 && cur < peakEnd;
+			const step = inPeak ? peakCutSec : normalCutSec;
+			const remaining = to - cur;
+			if (remaining <= step * 1.35) {
+				rawBoundaries.push(Number(to.toFixed(2)));
+				break;
+			}
+			cur = Number((cur + step).toFixed(2));
+			rawBoundaries.push(cur);
+		}
+	};
+
+	if (vocalEntry !== null) {
+		pushSectionCuts(0, vocalEntry);
+		pushSectionCuts(vocalEntry, total);
+	} else {
+		pushSectionCuts(0, total);
+	}
+
+	const slots: MusicalCutSlot[] = [];
+	for (let i = 0; i < rawBoundaries.length - 1; i++) {
+		const startTime = rawBoundaries[i];
+		const endTime = rawBoundaries[i + 1];
+		const duration = Number((endTime - startTime).toFixed(2));
+		if (duration < 0.45) continue;
+		const mid = (startTime + endTime) / 2;
+		const isPeak = mid >= peakStart && mid <= peakEnd;
+		const isVocalEntryBoundary = vocalEntry !== null && Math.abs(startTime - vocalEntry) < 0.08;
+		slots.push({
+			cutIndex: slots.length,
+			startTime,
+			endTime,
+			duration,
+			isPeak,
+			isVocalEntryBoundary,
+		});
+	}
+
+	return slots;
+}
