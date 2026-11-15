@@ -19,7 +19,7 @@ import { useAuth } from '@/hooks/useAuth';
 import { useAccount } from '@/hooks/useAccount';
 import { uploadMedia } from '@/lib/media';
 import { coverUrl } from '@/lib/covers';
-import { createCreation, refreshCreation } from '@/lib/studio';
+import { createCreation, fetchCreation, refreshCreation } from '@/lib/studio';
 import { Notice } from '@/components/ui/Field';
 
 export interface ArtistImageModalProps {
@@ -187,13 +187,8 @@ export function ArtistImageModal({
       const maxAttempts = 25;
 
       for (let attempt = 0; attempt < maxAttempts; attempt++) {
-        if (!supabase) break;
-
-        const { data: creation } = await supabase.
-        from('ai_creations').
-        select('status, result_urls, thumbnail_url, error_message').
-        eq('id', creationId).
-        maybeSingle();
+        await refreshCreation(creationId);
+        const creation = await fetchCreation(creationId);
 
         if (creation) {
           if (creation.status === 'ready') {
@@ -204,7 +199,6 @@ export function ArtistImageModal({
           }
         }
 
-        await refreshCreation(creationId);
         setProgressText(`Renderizando detalles... (${(attempt + 1) * 2}s)`);
         await new Promise((r) => setTimeout(r, 2000));
       }

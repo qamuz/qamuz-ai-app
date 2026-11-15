@@ -1,5 +1,13 @@
 import { supabase } from '@/integrations/supabase/client';
 import type { TrackWithArtist } from '@/types/music';
+import {
+	checkModalHealth,
+	createLocalModalCreation,
+	getLocalModalCreation,
+	getLocalModalCreations,
+	isLocalModalId,
+	refreshLocalModalCreation,
+} from '@/lib/modalClient';
 
 export type CreationKind = 'music' | 'video' | 'image';
 
@@ -100,7 +108,13 @@ export async function invokeStudio<T>(body: Record<string, unknown>): Promise<{ 
 	return { data: data as T };
 }
 
-export function createCreation(kind: CreationKind, prompt: string, options: Record<string, unknown>) {
+export async function createCreation(kind: CreationKind, prompt: string, options: Record<string, unknown>) {
+	if (kind === 'image' || kind === 'video') {
+		const modalHealth = await checkModalHealth();
+		if (modalHealth.visionConfigured && modalHealth.visionAuthOk) {
+			return createLocalModalCreation(kind, prompt, options);
+		}
+	}
 	return invokeStudio<{ id: string }>({ action: 'create', kind, prompt, options });
 }
 
@@ -115,7 +129,19 @@ export function saveTrimmedCreation(payload: {
 	return invokeStudio<{ id: string }>({ action: 'save_trimmed', ...payload });
 }
 
+export function saveRenderedVideo(payload: {
+	title: string;
+	video_url: string;
+	thumbnail_url?: string | null;
+	duration: number;
+	prompt?: string;
+	options: Record<string, unknown>;
+}) {
+	return invokeStudio<{ id: string }>({ action: 'save_rendered_video', ...payload });
+}
+
 export function refreshCreation(id: string) {
+	if (isLocalModalId(id)) return refreshLocalModalCreation(id);
 	return invokeStudio<{ ok: boolean }>({ action: 'status', id });
 }
 
@@ -124,12 +150,18 @@ export function fetchProvidersStatus() {
 }
 
 export async function fetchCreations(userId: string): Promise<Creation[]> {
-	if (!supabase) return [];
-	const { data } = await supabase.from('ai_creations').select(CREATION_SELECT).eq('user_id', userId).order('created_at', { ascending: false }).limit(60);
-	return (data as unknown as Creation[] | null) ?? [];
+	let dbRows: Creation[] = [];
+	if (supabase) {
+		const { data } = await supabase.from('ai_creations').select(CREATION_SELECT).eq('user_id', userId).order('created_at', { ascending: false }).limit(60);
+		dbRows = (data as unknown as Creation[] | null) ?? [];
+	}
+	const existingIds = new Set(dbRows.map((c) => c.id));
+	const localRows = getLocalModalCreations(existingIds);
+	return localRows.length > 0 ? [...localRows, ...dbRows] : dbRows;
 }
 
 export async function fetchCreation(id: string): Promise<Creation | null> {
+	if (isLocalModalId(id)) return getLocalModalCreation(id);
 	if (!supabase) return null;
 	const { data } = await supabase.from('ai_creations').select(CREATION_SELECT).eq('id', id).maybeSingle();
 	return (data as unknown as Creation | null) ?? null;
@@ -144,10 +176,16 @@ export async function fetchProviders(): Promise<ProviderInfo[]> {
 		.order('created_at');
 	const list = (data as ProviderInfo[] | null) ?? [];
 
-	// Prefer Modal (modal-image) as default for images, deactivate openai-image
+	// Prefer Modal (modal-image / modal-video) as active defaults when present
 	const hasModalImage = list.some((p) => p.slug === 'modal-image');
+	const hasActiveVideo = list.some((p) => p.kind === 'video' && p.is_active);
 	for (const p of list) {
 		if (p.slug === 'modal-image' && (!p.is_active || !p.is_default)) {
+			p.is_active = true;
+			p.is_default = true;
+			void supabase.from('ai_providers').update({ is_active: true, is_default: true }).eq('id', p.id);
+		}
+		if (!hasActiveVideo && p.slug === 'modal-video') {
 			p.is_active = true;
 			p.is_default = true;
 			void supabase.from('ai_providers').update({ is_active: true, is_default: true }).eq('id', p.id);

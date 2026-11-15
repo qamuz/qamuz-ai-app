@@ -20,6 +20,8 @@ import { useAccount } from '@/hooks/useAccount';
 import { isTrackOwner } from '@/lib/engagement';
 import { uploadMedia } from '@/lib/media';
 import { coverUrl } from '@/lib/covers';
+import { createCreation, fetchCreation, refreshCreation } from '@/lib/studio';
+import { magicEnhancePrompt } from '@/lib/nle/maestroDirector';
 import type { TrackWithArtist } from '@/types/music';
 
 export interface PublishModalProps {
@@ -70,6 +72,7 @@ export function PublishModal({ track, isOpen, onClose, onUpdated }: PublishModal
   const [isUploadingCover, setIsUploadingCover] = useState(false);
   const [showAiPrompt, setShowAiPrompt] = useState(false);
   const [aiPrompt, setAiPrompt] = useState('');
+  const [isSuggestingPrompt, setIsSuggestingPrompt] = useState(false);
   const [isGeneratingAiCover, setIsGeneratingAiCover] = useState(false);
 
   const [submitError, setSubmitError] = useState('');
@@ -145,20 +148,34 @@ export function PublishModal({ track, isOpen, onClose, onUpdated }: PublishModal
     }
   }
 
-  function handleSuggestPrompt() {
-    const randomStyle = AI_STYLES[Math.floor(Math.random() * AI_STYLES.length)];
-    const generated = `Portada artística musical para la canción "${title || track?.title || 'Generación'}", género ${genre || track?.genre || 'música moderna'}, ${randomStyle.prompt}, portada centrada de alta definición 8k`;
-    setAiPrompt(generated);
+  async function handleSuggestPrompt() {
+    if (isSuggestingPrompt || isGeneratingAiCover) return;
+    setIsSuggestingPrompt(true);
+    setSubmitError('');
+    try {
+      const randomStyle = AI_STYLES[Math.floor(Math.random() * AI_STYLES.length)];
+      const baseIdea = aiPrompt.trim() || `Portada artística musical para "${title || track?.title || 'canción'}", ${randomStyle.prompt}`;
+      const enhanced = await magicEnhancePrompt(baseIdea, {
+        mode: 'cover-prompt',
+        songTitle: title || track?.title || undefined,
+        style: genre || track?.genre || randomStyle.label,
+      });
+      setAiPrompt(enhanced);
+    } catch (err) {
+      setSubmitError(err instanceof Error ? err.message : 'No se pudo sugerir el prompt con IA.');
+    } finally {
+      setIsSuggestingPrompt(false);
+    }
   }
 
   function handleSelectStyle(stylePrompt: string) {
-    const nextPrompt = `Portada para "${title || track?.title || 'canción'}" (${genre || 'música'}), ${stylePrompt}, arte de portada de álbum 8k`;
+    const nextPrompt = `Portada de álbum para "${title || track?.title || 'canción'}" (${genre || 'música'}), ${stylePrompt}, composición icónica 8k`;
     setAiPrompt(nextPrompt);
     void handleGenerateAiCoverWithPrompt(nextPrompt);
   }
 
   async function handleGenerateAiCoverWithPrompt(customPrompt?: string) {
-    if (!user || !supabase) {
+    if (!user) {
       setSubmitError('Inicia sesión para generar portadas con IA.');
       return;
     }
@@ -170,31 +187,40 @@ export function PublishModal({ track, isOpen, onClose, onUpdated }: PublishModal
 
     setIsGeneratingAiCover(true);
     setSubmitError('');
+    setSubmitSuccess('');
     try {
-      const { data, error } = await supabase.functions.invoke('ai-studio', {
-        body: {
-          task: 'image',
-          prompt,
-          kind: 'image',
-        },
+      const createdRes = await createCreation('image', prompt, {
+        size: '1024x1024',
+        aspect_ratio: '1:1',
+        style: genre || 'Album cover',
       });
 
-      const returnedUrl = data?.url || data?.thumbnail_url || data?.image_url;
-      if (!error && returnedUrl) {
-        setCurrentCover(returnedUrl);
-        setSubmitSuccess('¡Portada recreada con éxito por la IA!');
-        setTimeout(() => setSubmitSuccess(''), 3500);
-      } else {
-        const randomPreset = `cover-${Math.floor(Math.random() * 6) + 1}`;
-        setCurrentCover(randomPreset);
-        setSubmitSuccess('¡Nueva portada artística generada por IA!');
-        setTimeout(() => setSubmitSuccess(''), 3500);
+      if (createdRes.error || !createdRes.data?.id) {
+        setSubmitError(createdRes.error || 'No se pudo iniciar la generación de la portada en Modal.');
+        return;
       }
-    } catch {
-      const randomPreset = `cover-${Math.floor(Math.random() * 6) + 1}`;
-      setCurrentCover(randomPreset);
-      setSubmitSuccess('¡Portada artística creada por IA!');
-      setTimeout(() => setSubmitSuccess(''), 3500);
+
+      const creationId = createdRes.data.id;
+      for (let i = 0; i < 48; i++) {
+        await new Promise((r) => setTimeout(r, 2500));
+        await refreshCreation(creationId);
+        const created = await fetchCreation(creationId);
+        if (created?.status === 'ready' && (created.result_urls?.[0] || created.thumbnail_url)) {
+          const url = created.result_urls?.[0] || created.thumbnail_url || '';
+          setCurrentCover(url);
+          setSubmitSuccess('¡Portada recreada con éxito por la IA!');
+          setTimeout(() => setSubmitSuccess(''), 3500);
+          return;
+        }
+        if (created?.status === 'error') {
+          setSubmitError(created.error_message || 'La IA devolvió un error al generar la portada.');
+          return;
+        }
+      }
+
+      setSubmitError('La generación de portada tardó demasiado. Intenta de nuevo en unos momentos.');
+    } catch (err) {
+      setSubmitError(err instanceof Error ? err.message : 'Error conectando con la IA de portadas.');
     } finally {
       setIsGeneratingAiCover(false);
     }
@@ -572,12 +598,16 @@ export function PublishModal({ track, isOpen, onClose, onUpdated }: PublishModal
                   </span>
                   <button
                     type="button"
-                    onClick={handleSuggestPrompt}
-                    disabled={isGeneratingAiCover}
-                    className="flex items-center gap-1 text-[11px] font-semibold text-muted-foreground hover:text-primary transition-colors"
+                    onClick={() => void handleSuggestPrompt()}
+                    disabled={isGeneratingAiCover || isSuggestingPrompt}
+                    className="flex items-center gap-1 text-[11px] font-semibold text-muted-foreground hover:text-primary transition-colors disabled:opacity-50"
                   >
-                    <Wand2 className="h-3 w-3 text-primary" />
-                    Sugerir prompt
+                    {isSuggestingPrompt ? (
+                      <Loader2 className="h-3 w-3 animate-spin text-primary" />
+                    ) : (
+                      <Wand2 className="h-3 w-3 text-primary" />
+                    )}
+                    {isSuggestingPrompt ? 'Pensando...' : 'Sugerir prompt'}
                   </button>
                 </div>
 

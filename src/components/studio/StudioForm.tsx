@@ -2,6 +2,7 @@ import { useState, type ReactNode } from 'react';
 import { AudioWaveform, Disc3, Loader2, Mic, Music2, Sparkles, Wand2, X } from 'lucide-react';
 import { useI18n } from '@/hooks/useI18n';
 import { invokeStudio, type CreationKind } from '@/lib/studio';
+import { checkModalHealth, writeLyricsWithModal } from '@/lib/modalClient';
 import { StudioTemplatesModal } from '@/components/studio/StudioTemplatesModal';
 import { MakeABeatModal } from '@/components/studio/MakeABeatModal';
 import { ReferenceAudioModal, type ReferenceAudio } from '@/components/studio/ReferenceAudioModal';
@@ -136,6 +137,28 @@ export function StudioForm({ kind, provider, credits, submitting, seed, onSubmit
     if (writing) return;
     setWriting(true);
     setWriteError('');
+
+    const modalHealth = await checkModalHealth();
+    if ((modalHealth.visionConfigured && modalHealth.visionAuthOk) || modalHealth.vllmConfigured) {
+      const modalRes = await writeLyricsWithModal({
+        idea: prompt || title || style,
+        style,
+        title,
+        lyrics,
+        mode: lyrics.trim() ? 'optimize' : 'lyrics',
+        language: locale,
+      });
+      setWriting(false);
+      if (modalRes.lyrics && modalRes.lyrics.trim()) {
+        setLyrics(modalRes.lyrics.trim());
+        return;
+      }
+      if (modalRes.error) {
+        setWriteError(modalRes.error);
+        return;
+      }
+    }
+
     const { data, error } = await invokeStudio<{lyrics?: string;call_id?: string;}>({ action: 'lyrics_write', idea: prompt, style, title, lyrics, lang: locale });
     let text = data?.lyrics ?? '';
     let failure = error ?? '';
@@ -154,6 +177,21 @@ export function StudioForm({ kind, provider, credits, submitting, seed, onSubmit
           failure = '';
           break;
         }
+      }
+    }
+    if ((failure || !text.trim()) && modalHealth.geminiConfigured) {
+      const fallbackRes = await writeLyricsWithModal({
+        idea: prompt || title || style,
+        style,
+        title,
+        lyrics,
+        mode: lyrics.trim() ? 'optimize' : 'lyrics',
+        language: locale,
+      });
+      if (fallbackRes.lyrics && fallbackRes.lyrics.trim()) {
+        setWriting(false);
+        setLyrics(fallbackRes.lyrics.trim());
+        return;
       }
     }
     setWriting(false);

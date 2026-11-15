@@ -6,6 +6,7 @@ import { useAccount } from '@/hooks/useAccount';
 import { useAuth } from '@/hooks/useAuth';
 import { useI18n } from '@/hooks/useI18n';
 import { videoSourceOf, type Creation } from '@/lib/studio';
+import { isLocalModalId, removeLocalModalCreation } from '@/lib/modalClient';
 import { useModules } from '@/hooks/useModules';
 import { publishMusicVideo } from '@/lib/videos';
 import { formatTime } from '@/lib/format';
@@ -139,6 +140,11 @@ export function CreationRow({ creation, onChange, onDeleted, onOpen }: Props) {
   }
 
   async function remove() {
+    if (isLocalModalId(creation.id)) {
+      removeLocalModalCreation(creation.id);
+      onDeleted(creation.id);
+      return;
+    }
     if (!supabase || !user) return;
     setBusy(true);
     const { error } = await supabase.from('ai_creations').delete().eq('id', creation.id).eq('user_id', user.id);
@@ -251,7 +257,7 @@ export function CreationRow({ creation, onChange, onDeleted, onOpen }: Props) {
       }
 
       {creation.kind === 'video' && showVideo && creation.result_urls[0] &&
-      <video data-ev-id="ev_cr_video" src={creation.result_urls[0]} poster={creation.thumbnail_url ?? undefined} controls autoPlay playsInline className="aspect-video w-full rounded-lg bg-black object-contain" />
+      <video data-ev-id="ev_cr_video" src={creation.result_urls[0]} poster={creation.thumbnail_url ?? undefined} controls autoPlay playsInline className="aspect-video max-h-[340px] w-full rounded-lg bg-black object-contain" />
       }
 
       {creation.status === 'error' && creation.error_message &&

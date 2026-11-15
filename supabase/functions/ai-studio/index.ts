@@ -856,9 +856,13 @@ Deno.serve(async (req) => {
 					const songTitle = typeof src.title === 'string' ? src.title.slice(0, 120) : null;
 					await admin.from('ai_creations').update({ thumbnail_url: cover, title: songTitle }).eq('id', creation.id);
 				}
-				// Animates the song cover when there is one; otherwise Modal makes the first frame from the prompt.
-				// The cover is downloaded here and sent inline: some image hosts block Modal's downloader (HTTP 403).
-				const image = cover ? await toDataUri(cover) : '';
+				const refImg = typeof options.reference_image_url === 'string' && /^https:\/\//.test(options.reference_image_url) ? options.reference_image_url : null;
+				if (!cover && refImg) {
+					await admin.from('ai_creations').update({ thumbnail_url: refImg }).eq('id', creation.id);
+				}
+				// Animates the chosen start image or song cover; otherwise Modal makes the first frame from the prompt.
+				const startImgUrl = refImg || cover;
+				const image = startImgUrl ? await toDataUri(startImgUrl) : '';
 				await startModal(admin, creation, apiKey, 'video', {
 					prompt: `${prompt}${style}`.slice(0, 1000),
 					image,
@@ -901,10 +905,13 @@ Deno.serve(async (req) => {
 				const style = options.style ? `. Estilo: ${String(options.style)}` : '';
 				const aspect = options.aspect === '9:16' || String(options.size) === '1024x1536' ? '9:16' : '16:9';
 				const src = (options.source ?? null) as Record<string, unknown> | null;
+				const refImg = typeof options.reference_image_url === 'string' && /^https:\/\//.test(options.reference_image_url) ? options.reference_image_url : null;
 				if (src && typeof src.audio_url === 'string') {
-					const cover = typeof src.cover_url === 'string' && /^https:\/\//.test(src.cover_url) ? src.cover_url : null;
+					const cover = typeof src.cover_url === 'string' && /^https:\/\//.test(src.cover_url) ? src.cover_url : refImg;
 					const songTitle = typeof src.title === 'string' ? src.title.slice(0, 120) : null;
 					await admin.from('ai_creations').update({ thumbnail_url: cover, title: songTitle }).eq('id', creation.id);
+				} else if (refImg) {
+					await admin.from('ai_creations').update({ thumbnail_url: refImg }).eq('id', creation.id);
 				}
 				await startVideo(admin, creation, provider, apiKey, `${prompt}${style}`, aspect);
 			}
@@ -964,6 +971,41 @@ Deno.serve(async (req) => {
 				return json({ error: 'No se pudo guardar la creación en el espacio de trabajo' }, 500);
 			}
 
+			return json({ id: creation.id });
+		}
+
+		if (action === 'save_rendered_video') {
+			const title = String(body.title ?? 'Video Timeline Studio').trim().slice(0, 120);
+			const videoUrl = String(body.video_url ?? '');
+			const thumbnailUrl = typeof body.thumbnail_url === 'string' && /^https:\/\/[^\s]+$/i.test(body.thumbnail_url) && body.thumbnail_url.length <= 2048 ? body.thumbnail_url : null;
+			const duration = Math.max(1, Math.round(Number(body.duration ?? 0)));
+			const options = (body.options ?? {}) as Record<string, unknown>;
+			const isSafeUrl = (u: unknown) => typeof u === 'string' && /^https:\/\/[^\s]+$/i.test(u) && u.length <= 2048;
+			if (!isSafeUrl(videoUrl)) return json({ error: 'URL de video inválida' }, 400);
+
+			const prompt = String(body.prompt ?? `Timeline Studio: ${title}`).slice(0, 500);
+			const { data: creation, error: insertError } = await admin
+				.from('ai_creations')
+				.insert({
+					user_id: user.id,
+					kind: 'video',
+					prompt,
+					options,
+					status: 'ready',
+					provider_slug: 'timeline-studio',
+					title,
+					result_urls: [videoUrl],
+					thumbnail_url: thumbnailUrl,
+					duration_seconds: duration,
+					credits_spent: 0,
+				})
+				.select('id, user_id, kind, status, provider_slug, external_task_id, credits_spent')
+				.single<Creation>();
+
+			if (insertError || !creation) {
+				console.error('save_rendered_video insert error', insertError);
+				return json({ error: 'No se pudo guardar el video en el espacio de trabajo' }, 500);
+			}
 			return json({ id: creation.id });
 		}
 

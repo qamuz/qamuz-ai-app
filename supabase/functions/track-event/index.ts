@@ -73,6 +73,7 @@ Deno.serve(async (req) => {
 	}
 
 	const weekAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+	// eslint-disable-next-line @typescript-eslint/no-explicit-any
 	const countOf = async (table: string, filter: (q: any) => any) => {
 		const { count } = await filter(admin.from(table).select('id', { count: 'exact', head: true }).eq('track_id', trackId));
 		return count ?? 0;

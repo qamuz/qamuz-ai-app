@@ -1,0 +1,8 @@
+{
+  "name": "Qamuz AI",
+  "description": "Escucha música con letras sincronizadas, descubre artistas y crea música, videos e imágenes con IA en Qamuz AI.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

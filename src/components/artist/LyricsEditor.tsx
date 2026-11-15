@@ -9,6 +9,7 @@ import type { OwnedArtist } from '@/contexts/account-context';
 import { TabBar } from '@/components/TabBar';
 import { Field, GhostButton, Notice, PrimaryButton, Select, TextArea } from '@/components/ui/Field';
 import { invokeStudio } from '@/lib/studio';
+import { checkModalHealth, writeLyricsWithModal } from '@/lib/modalClient';
 
 type Mode = 'lrc' | 'tap';
 
@@ -61,6 +62,28 @@ export function LyricsEditor({ artist }: {artist: OwnedArtist;}) {
     if (aiWriting || !track) return;
     setAiWriting(true);
     setStatus(null);
+
+    const modalHealth = await checkModalHealth();
+    if ((modalHealth.visionConfigured && modalHealth.visionAuthOk) || modalHealth.vllmConfigured) {
+      const modalRes = await writeLyricsWithModal({
+        idea: track.title,
+        title: track.title,
+        lyrics: plain || lrc,
+        mode: (plain || lrc).trim() ? 'optimize' : 'lyrics',
+        language: 'es',
+      });
+      setAiWriting(false);
+      if (modalRes.lyrics && modalRes.lyrics.trim()) {
+        setPlain(modalRes.lyrics.trim());
+        setStatus({ tone: 'success', text: 'Letra generada con éxito con IA en Modal. Ahora puedes sincronizarla.' });
+        return;
+      }
+      if (modalRes.error) {
+        setStatus({ tone: 'error', text: modalRes.error });
+        return;
+      }
+    }
+
     const { data, error } = await invokeStudio<{ lyrics?: string; call_id?: string }>({
       action: 'lyrics_write',
       idea: track.title,
@@ -86,6 +109,21 @@ export function LyricsEditor({ artist }: {artist: OwnedArtist;}) {
           failure = '';
           break;
         }
+      }
+    }
+    if ((failure || !text.trim()) && modalHealth.geminiConfigured) {
+      const fallbackRes = await writeLyricsWithModal({
+        idea: track.title,
+        title: track.title,
+        lyrics: plain || lrc,
+        mode: (plain || lrc).trim() ? 'optimize' : 'lyrics',
+        language: 'es',
+      });
+      if (fallbackRes.lyrics && fallbackRes.lyrics.trim()) {
+        setAiWriting(false);
+        setPlain(fallbackRes.lyrics.trim());
+        setStatus({ tone: 'success', text: 'Letra generada con éxito con IA. Ahora puedes sincronizarla.' });
+        return;
       }
     }
     setAiWriting(false);

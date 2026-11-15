@@ -8,7 +8,8 @@ import { ModuleDisabled } from '@/components/ModuleDisabled';
 import { CreationRow } from '@/components/studio/CreationRow';
 import { SongRow } from '@/components/studio/SongRow';
 import { SongPanel } from '@/components/studio/SongPanel';
-import { VideoForm } from '@/components/studio/VideoForm';
+import { NleEditorShell } from '@/components/studio/nle/NleEditorShell';
+import { ImageForm } from '@/components/studio/ImageForm';
 import { StudioForm, type FormSeed } from '@/components/studio/StudioForm';
 import { characterById } from '@/lib/characters';
 import { useI18n } from '@/hooks/useI18n';
@@ -16,6 +17,7 @@ import { useAuth } from '@/hooks/useAuth';
 import { useAccount } from '@/hooks/useAccount';
 import { useModules } from '@/hooks/useModules';
 import { usePlayer } from '@/hooks/usePlayer';
+import { checkModalHealth, type ModalHealth } from '@/lib/modalClient';
 import {
   createCreation,
   fetchCreations,
@@ -44,9 +46,9 @@ const FILTERS: {id: SongFilter;label: string;}[] = [
 { id: 'liked', label: 'Liked' },
 { id: 'video', label: 'With video' }];
 
-const MIN_FORM_WIDTH = 300;
-const MAX_FORM_WIDTH = 620;
-const DEFAULT_FORM_WIDTH = 380;
+const MIN_FORM_WIDTH = 290;
+const MAX_FORM_WIDTH = 540;
+const DEFAULT_FORM_WIDTH = 360;
 const FORM_WIDTH_STORAGE_KEY = 'qamuz:studio:form_width';
 
 function StudioContent() {
@@ -56,6 +58,11 @@ function StudioContent() {
   const { current, playTracks, setSidePanelOpen } = usePlayer();
   const { t } = useI18n();
 
+  const [params, setParams] = useSearchParams();
+  const urlKind = params.get('kind');
+  const urlPrompt = params.get('prompt') ?? '';
+  const [kind, setKind] = useState<CreationKind>(urlKind === 'video' || urlKind === 'image' ? urlKind : 'music');
+
   const [formWidth, setFormWidth] = useState<number>(() => {
     if (typeof window === 'undefined') return DEFAULT_FORM_WIDTH;
     const saved = localStorage.getItem(FORM_WIDTH_STORAGE_KEY);
@@ -63,20 +70,34 @@ function StudioContent() {
     return Number.isFinite(parsed) && parsed >= MIN_FORM_WIDTH && parsed <= MAX_FORM_WIDTH ? parsed : DEFAULT_FORM_WIDTH;
   });
   const [isResizing, setIsResizing] = useState(false);
-  const [isDesktop, setIsDesktop] = useState(() => typeof window !== 'undefined' && window.innerWidth >= 1024);
+  const [isSideBySide, setIsSideBySide] = useState(() => typeof window !== 'undefined' && window.innerWidth >= 768);
 
   useEffect(() => {
     const onResize = () => {
-      const desktop = window.innerWidth >= 1024;
-      setIsDesktop(desktop);
-      if (desktop) {
-        const maxAllowed = Math.min(MAX_FORM_WIDTH, Math.floor(window.innerWidth * 0.48));
-        setFormWidth((prev) => prev > maxAllowed ? maxAllowed : prev);
+      const wide = window.innerWidth >= 768;
+      setIsSideBySide(wide);
+      if (wide) {
+        const ratioCap = window.innerWidth < 1100 ? 0.40 : 0.44;
+        const maxAllowed = Math.min(MAX_FORM_WIDTH, Math.floor(window.innerWidth * ratioCap));
+        setFormWidth((prev) => prev > maxAllowed ? Math.max(MIN_FORM_WIDTH, maxAllowed) : prev);
       }
     };
     window.addEventListener('resize', onResize);
     return () => window.removeEventListener('resize', onResize);
   }, []);
+
+  // Broadcast current Studio kind so Sidebar auto-collapses in Video mode
+  useEffect(() => {
+    window.dispatchEvent(new CustomEvent('qamuz:studio-kind', { detail: kind }));
+    if (params.get('kind') !== kind) {
+      const next = new URLSearchParams(params);
+      next.set('kind', kind);
+      setParams(next, { replace: true });
+    }
+    return () => {
+      window.dispatchEvent(new CustomEvent('qamuz:studio-kind', { detail: null }));
+    };
+  }, [kind]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const handleMouseDown = useCallback((e: React.MouseEvent) => {
     e.preventDefault();
@@ -86,7 +107,8 @@ function StudioContent() {
 
     const onMouseMove = (moveEvent: MouseEvent) => {
       const deltaX = moveEvent.clientX - startX;
-      const maxAllowed = Math.min(MAX_FORM_WIDTH, Math.floor(window.innerWidth * 0.48));
+      const ratioCap = window.innerWidth < 1100 ? 0.40 : 0.44;
+      const maxAllowed = Math.min(MAX_FORM_WIDTH, Math.floor(window.innerWidth * ratioCap));
       const nextWidth = Math.min(maxAllowed, Math.max(MIN_FORM_WIDTH, startWidth + deltaX));
       setFormWidth(nextWidth);
     };
@@ -99,12 +121,12 @@ function StudioContent() {
       setIsResizing(false);
 
       const deltaX = upEvent.clientX - startX;
-      const maxAllowed = Math.min(MAX_FORM_WIDTH, Math.floor(window.innerWidth * 0.48));
+      const ratioCap = window.innerWidth < 1100 ? 0.40 : 0.44;
+      const maxAllowed = Math.min(MAX_FORM_WIDTH, Math.floor(window.innerWidth * ratioCap));
       const finalWidth = Math.min(maxAllowed, Math.max(MIN_FORM_WIDTH, startWidth + deltaX));
       try {
         localStorage.setItem(FORM_WIDTH_STORAGE_KEY, String(finalWidth));
       } catch {
-
         // ignore
       }};
 
@@ -113,10 +135,7 @@ function StudioContent() {
     window.addEventListener('mousemove', onMouseMove);
     window.addEventListener('mouseup', onMouseUp);
   }, [formWidth]);
-  const [params] = useSearchParams();
-  const urlKind = params.get('kind');
-  const urlPrompt = params.get('prompt') ?? '';
-  const [kind, setKind] = useState<CreationKind>(urlKind === 'video' || urlKind === 'image' ? urlKind : 'music');
+
   const urlCharacter = characterById(params.get('character'));
   const [seed, setSeed] = useState<{n: number;value: FormSeed | null;}>({
     n: 0,
@@ -124,8 +143,8 @@ function StudioContent() {
     { mode: 'simple', prompt: urlPrompt.slice(0, 450), persona: urlCharacter ?? undefined } :
     null
   });
-  const [videoExtra] = useState(urlKind === 'video' ? urlPrompt.slice(0, 500) : '');
   const [providers, setProviders] = useState<ProviderInfo[]>([]);
+  const [modalHealth, setModalHealth] = useState<ModalHealth | null>(null);
   const [creations, setCreations] = useState<Creation[]>([]);
   const [submitting, setSubmitting] = useState(false);
   const [message, setMessage] = useState<{type: 'ok' | 'error';text: string;} | null>(null);
@@ -145,6 +164,7 @@ function StudioContent() {
   useEffect(() => {
     void load();
     void fetchProviders().then(setProviders);
+    void checkModalHealth().then(setModalHealth);
 
     const onCreationsUpdated = () => {
       void load();
@@ -169,8 +189,26 @@ function StudioContent() {
 
   const provider = useMemo(() => {
     const list = providers.filter((p) => p.kind === kind);
-    return list.find((p) => p.is_active && p.is_default) ?? list.find((p) => p.is_active) ?? list[0] ?? null;
-  }, [providers, kind]);
+    const dbMatch = list.find((p) => p.is_active && p.is_default) ?? list.find((p) => p.is_active) ?? list[0] ?? null;
+    if (modalHealth?.visionConfigured && modalHealth?.visionAuthOk && (kind === 'image' || kind === 'video')) {
+      if (dbMatch && dbMatch.is_active) {
+        return { ...dbMatch, credit_cost: 0 };
+      }
+      return {
+        id: `local-modal-${kind}`,
+        slug: kind === 'image' ? 'modal-image' : 'modal-video',
+        name: kind === 'image' ? 'Modal · Qamuz Vision' : 'Modal · Qamuz Video',
+        kind,
+        secret_name: 'QAMUZ_SERVICE_TOKEN',
+        model: kind === 'image' ? 'qamuz-image-flux' : 'qamuz-video-svd',
+        is_active: true,
+        is_default: true,
+        credit_cost: 0,
+        notes: 'Conectado por AI Studio Secrets',
+      } satisfies ProviderInfo;
+    }
+    return dbMatch;
+  }, [providers, kind, modalHealth]);
 
   const creationById = useMemo(() => new Map(creations.map((c) => [c.id, c])), [creations]);
   const aiSongs = useMemo(() => creations.flatMap(songsFromCreation), [creations]);
@@ -314,20 +352,49 @@ function StudioContent() {
   visible.
   filter((c) => !q || `${c.title ?? ''} ${c.prompt}`.toLowerCase().includes(q)).
   map((c) =>
-  <CreationRow key={c.id} creation={c} onChange={() => void load()} onDeleted={removeCreation} onOpen={c.kind === 'video' && videoSourceOf(c) ? () => openVideo(c) : undefined} />
+  <CreationRow key={c.id} creation={c} onChange={() => void load()} onDeleted={removeCreation} onOpen={c.kind === 'video' ? () => openVideo(c) : undefined} />
   );
 
+  const effectiveFormWidth = useMemo(() => {
+    if (!isSideBySide) return undefined;
+    if (typeof window === 'undefined') return formWidth;
+    const maxCap = window.innerWidth < 1100 ? Math.floor(window.innerWidth * 0.38) : MAX_FORM_WIDTH;
+    return Math.max(MIN_FORM_WIDTH, Math.min(formWidth, maxCap));
+  }, [isSideBySide, formWidth]);
+
+  if (kind === 'video' && user) {
+    return (
+      <NleEditorShell
+        kind={kind}
+        onChangeKind={(next) => {
+          setKind(next);
+          setMessage(null);
+        }}
+        userId={user.id}
+        songs={readySongs}
+        creations={creations}
+        videoProvider={provider}
+        credits={credits}
+        initialSongKey={videoPick}
+        onWorkspaceUpdated={() => {
+          void load();
+          void refreshAccount();
+        }}
+      />
+    );
+  }
+
   return (
-    <div data-ev-id="ev_ff56bda520" className={`flex w-full flex-col gap-6 transition-[padding] lg:flex-row lg:gap-0 ${selected ? 'xl:pr-[392px]' : ''}`}>
+    <div data-ev-id="ev_ff56bda520" className={`flex w-full flex-col gap-6 transition-[padding] md:flex-row md:gap-0 ${selected ? 'xl:pr-[392px]' : ''}`}>
       {/* Left: creation panel (resizable) */}
       <aside
         data-ev-id="ev_st_left"
         style={{
-          width: isDesktop ? `${formWidth}px` : undefined,
-          minWidth: isDesktop ? `${formWidth}px` : undefined,
-          maxWidth: isDesktop ? `${formWidth}px` : undefined
+          width: effectiveFormWidth ? `${effectiveFormWidth}px` : undefined,
+          minWidth: effectiveFormWidth ? `${effectiveFormWidth}px` : undefined,
+          maxWidth: effectiveFormWidth ? `${effectiveFormWidth}px` : undefined
         }}
-        className="relative no-scrollbar flex flex-none flex-col gap-3 lg:sticky lg:top-[76px] lg:max-h-[calc(100vh-92px)] lg:self-start lg:overflow-y-auto lg:border-r lg:border-border lg:pr-5">
+        className="relative no-scrollbar flex flex-none flex-col gap-3 md:sticky md:top-[76px] md:max-h-[calc(100vh-92px)] md:self-start md:overflow-y-auto md:border-r md:border-border md:pr-4">
         
         <div data-ev-id="ev_st_kinds" className="flex items-center justify-between gap-2">
           <div data-ev-id="ev_st_kinds_l" role="tablist" className="flex items-center gap-1 rounded-xl bg-surface-2 p-1">
@@ -335,12 +402,12 @@ function StudioContent() {
               const Icon = k.icon;
               const on = kind === k.id;
               return (
-                <button data-ev-id="ev_st_kind" key={k.id} type="button" role="tab" aria-selected={on} onClick={() => {setKind(k.id);setMessage(null);}} className={`inline-flex h-8 items-center gap-1.5 rounded-lg px-3 text-xs font-bold transition-colors ${on ? 'bg-surface-3 text-foreground' : 'text-muted-foreground hover:text-foreground'}`}>
+                <button data-ev-id="ev_st_kind" key={k.id} type="button" role="tab" aria-selected={on} onClick={() => {setKind(k.id);setMessage(null);}} className={`inline-flex h-8 items-center gap-1.5 rounded-lg px-2.5 text-xs font-bold transition-colors ${on ? 'bg-surface-3 text-foreground' : 'text-muted-foreground hover:text-foreground'}`}>
                   <Icon className="h-3.5 w-3.5" /> {t(k.label)}
                 </button>);
             })}
           </div>
-          <span data-ev-id="ev_1d2d903693" className="flex items-center gap-1.5 rounded-lg border border-border px-2.5 py-1.5 text-xs font-bold tabular-nums">
+          <span data-ev-id="ev_1d2d903693" className="flex items-center gap-1.5 rounded-lg border border-border px-2 py-1.5 text-xs font-bold tabular-nums">
             <Coins className="h-3.5 w-3.5 text-primary" /> {credits ?? 0}
             {isEnabled('payments') && <Link data-ev-id="ev_3ca6ccdf73" to="/planes" className="ml-1 font-semibold text-primary hover:underline">{t('Get more')}</Link>}
           </span>
@@ -350,10 +417,11 @@ function StudioContent() {
         <p data-ev-id="ev_eb8ffecc91" role="status" className={`rounded-lg px-3 py-2 text-xs ${message.type === 'ok' ? 'bg-primary/10 text-primary' : 'bg-destructive/10 text-destructive'}`}>{message.text}</p>
         }
 
-        {kind === 'video' && user ?
-        <VideoForm key={`video-${videoPick ?? ''}`} songs={readySongs} initialKey={videoPick} initialExtra={videoExtra} userId={user.id} provider={provider} credits={credits} submitting={submitting} onSubmit={(p, o) => void handleCreate(p, o)} /> :
-        <StudioForm key={`${kind}-${seed.n}`} kind={kind} seed={kind === 'music' ? seed.value : null} provider={provider} credits={credits} submitting={submitting} onSubmit={(p, o) => void handleCreate(p, o)} />
-        }
+        {kind === 'image' && user ? (
+          <ImageForm key="image-form" provider={provider} credits={credits} submitting={submitting} userId={user.id} creations={creations} onSubmit={(p, o) => void handleCreate(p, o)} />
+        ) : (
+          <StudioForm key={`${kind}-${seed.n}`} kind={kind} seed={kind === 'music' ? seed.value : null} provider={provider} credits={credits} submitting={submitting} onSubmit={(p, o) => void handleCreate(p, o)} />
+        )}
 
         {kind === 'music' && !artist && isEnabled('artists') &&
         <p data-ev-id="ev_a52a1d8984" className="text-xs text-muted-foreground">
@@ -377,7 +445,7 @@ function StudioContent() {
 
             // ignore
           }}}
-        className={`group absolute -right-2 top-0 bottom-0 z-20 hidden w-4 cursor-col-resize select-none items-center justify-center lg:flex ${
+        className={`group absolute -right-2 top-0 bottom-0 z-20 hidden w-4 cursor-col-resize select-none items-center justify-center md:flex ${
         isResizing ? 'cursor-col-resize' : ''}`
         }>
           
@@ -398,8 +466,8 @@ function StudioContent() {
         </div>
       </aside>
 
-      {/* Right: workspace */}
-      <section data-ev-id="ev_82782513c9" className="flex min-w-0 flex-col gap-4 lg:pl-5">
+      {/* Right: workspace (always beside the form on md+) */}
+      <section data-ev-id="ev_82782513c9" className="flex min-w-0 flex-1 flex-col gap-4 md:pl-5">
         <div data-ev-id="ev_st_ws_h" className="flex items-baseline justify-between gap-3">
           <h1 data-ev-id="ev_2db8ae36db" className="text-lg font-bold tracking-tight">{t('My workspace')}</h1>
           <div data-ev-id="ev_st_ws_r" className="flex items-center gap-3">
