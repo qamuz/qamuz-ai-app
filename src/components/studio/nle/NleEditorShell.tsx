@@ -20,6 +20,7 @@ import { Link } from 'react-router';
 import { useI18n } from '@/hooks/useI18n';
 import { useModules } from '@/hooks/useModules';
 import { uploadMedia } from '@/lib/media';
+import { deriveRecommendedMotion } from '@/lib/music-video/presets';
 import {
 	createCreation,
 	fetchCreation,
@@ -34,13 +35,19 @@ import { primaryButton } from '@/lib/ui';
 import {
 	analyzeAudioTrack,
 	buildMusicalCutGrid,
-	type MusicalCutSlot,
+	type AudioAnalysisResult,
 } from '@/lib/nle/audioAnalyzer';
 import {
+	alignTimeToBeatSlot,
+	applyGridTrimToTrack,
+	buildCompasGridMarkers,
+	buildDynamicBeatClips,
 	computeTimelineDuration,
 	createInitialTracksFromSong,
 	deleteClipFromTracks,
 	makeClipId,
+	snapToNearestGridMarker,
+	snapVideoTracksToGrid,
 	splitClipAtTime,
 } from '@/lib/nle/project';
 import { renderNleProject } from '@/lib/nle/renderer';
@@ -184,7 +191,66 @@ export function NleEditorShell({
 	const [ytSeoError, setYtSeoError] = useState<string | null>(null);
 	const [ytCopied, setYtCopied] = useState(false);
 
+	const [beatAnalysis, setBeatAnalysis] = useState<AudioAnalysisResult | null>(null);
+	const [autoBeatSync, setAutoBeatSync] = useState(true);
+	const [snapToGrid, setSnapToGrid] = useState(true);
+
 	const totalDuration = useMemo(() => computeTimelineDuration(tracks), [tracks]);
+
+	const primaryAudioClip = useMemo(() => {
+		const a1 = tracks.find((t) => t.id === 'track-a1')?.clips[0];
+		if (a1?.sourceUrl) return a1;
+		return tracks.find((t) => t.kind === 'audio')?.clips.find((c) => Boolean(c.sourceUrl)) ?? null;
+	}, [tracks]);
+
+	// Automatically analyze the active song's BPM, compás phase (beatOffset), and energy envelope
+	useEffect(() => {
+		const audioUrl = primaryAudioClip?.sourceUrl || initialSong?.audioUrl || '';
+		const durHint = primaryAudioClip?.duration || initialSong?.duration || 45;
+		if (!audioUrl) {
+			setBeatAnalysis(null);
+			return;
+		}
+		let cancelled = false;
+		const songMatch =
+			songs.find((s) => s.audioUrl === audioUrl) ??
+			(initialSong?.audioUrl === audioUrl ? initialSong : null);
+
+		void analyzeAudioTrack(audioUrl, durHint, songMatch?.lyrics).then((result) => {
+			if (!cancelled) {
+				setBeatAnalysis(result);
+			}
+		});
+		return () => {
+			cancelled = true;
+		};
+	}, [primaryAudioClip?.sourceUrl, primaryAudioClip?.duration, initialSong, songs]);
+
+	const beatCutSlots = useMemo(() => {
+		if (!beatAnalysis) return [];
+		const targetDur = Math.max(4, primaryAudioClip?.duration || beatAnalysis.duration || totalDuration);
+		return buildMusicalCutGrid({
+			duration: targetDur,
+			bpm: beatAnalysis.estimatedBpm,
+			beatOffset: beatAnalysis.beatOffset,
+			energyBins: beatAnalysis.energyBins,
+			vocalEntryTime: beatAnalysis.vocalEntryTime,
+			peakHookStart: beatAnalysis.peakHookStart,
+			peakHookEnd: beatAnalysis.peakHookEnd,
+		});
+	}, [beatAnalysis, primaryAudioClip?.duration, totalDuration]);
+
+	const compasGridMarkers = useMemo(
+		() =>
+			buildCompasGridMarkers({
+				totalDuration: Math.max(totalDuration, primaryAudioClip?.duration || 0),
+				beatTimes: beatAnalysis?.beatTimes,
+				barTimes: beatAnalysis?.barTimes,
+				beatCutSlots,
+				vocalEntryTime: beatAnalysis?.vocalEntryTime ?? null,
+			}),
+		[totalDuration, primaryAudioClip?.duration, beatAnalysis, beatCutSlots]
+	);
 
 	// Re-seed if user came with an explicit handoff song key after initial mount
 	const seededKeyRef = useRef<string | null>(initialSong?.key ?? null);
@@ -250,31 +316,82 @@ export function NleEditorShell({
 		);
 	}, []);
 
+	const handleSnapTrackToGrid = useCallback(
+		(trackId?: string) => {
+			setTracks((prev) => snapVideoTracksToGrid(prev, compasGridMarkers, trackId));
+		},
+		[compasGridMarkers]
+	);
+
+	const handleGridTrimClip = useCallback(
+		(
+			trackId: string,
+			clipId: string,
+			mode: 'trim-left' | 'trim-right',
+			targetTime: number
+		) => {
+			setTracks((prev) =>
+				prev.map((tr) => {
+					if (tr.id !== trackId || tr.locked || tr.kind !== 'video') return tr;
+					return {
+						...tr,
+						clips: applyGridTrimToTrack(
+							tr.clips,
+							clipId,
+							mode,
+							targetTime,
+							compasGridMarkers
+						),
+					};
+				})
+			);
+		},
+		[compasGridMarkers]
+	);
+
+	const handleToggleSnapToGrid = useCallback(() => {
+		setSnapToGrid((prev) => {
+			const next = !prev;
+			if (next) {
+				setTracks((curTracks) => snapVideoTracksToGrid(curTracks, compasGridMarkers));
+			}
+			return next;
+		});
+	}, [compasGridMarkers]);
+
 	const handleSplitAtPlayhead = useCallback(() => {
+		const rawAt = playheadRef.current;
+		const splitAt = snapToGrid
+			? snapToNearestGridMarker(rawAt, compasGridMarkers, 0)
+			: rawAt;
+
 		if (selectedClipId) {
-			setTracks((prev) => splitClipAtTime(prev, selectedClipId, playheadRef.current));
+			setTracks((prev) => splitClipAtTime(prev, selectedClipId, splitAt));
 			return;
 		}
-		// If nothing selected, split active V1 clip at playhead
+		// If nothing selected, split active V1 clip at playhead (snapped to compás when Snap-to-Grid is ON)
 		const v1 = tracks.find((t) => t.id === 'track-v1') ?? tracks.find((t) => t.kind === 'video');
 		const active = v1?.clips.find(
-			(c) => playheadRef.current > c.startTime + 0.5 && playheadRef.current < c.startTime + c.duration - 0.5
+			(c) => splitAt > c.startTime + 0.45 && splitAt < c.startTime + c.duration - 0.45
 		);
 		if (active) {
-			setTracks((prev) => splitClipAtTime(prev, active.id, playheadRef.current));
+			setTracks((prev) => splitClipAtTime(prev, active.id, splitAt));
 		}
-	}, [selectedClipId, tracks]);
+	}, [selectedClipId, tracks, snapToGrid, compasGridMarkers]);
 
 	const handleDeleteSelected = useCallback(() => {
 		if (!selectedClipId) return;
-		setTracks((prev) => deleteClipFromTracks(prev, selectedClipId));
+		setTracks((prev) => {
+			const afterDelete = deleteClipFromTracks(prev, selectedClipId);
+			return snapToGrid ? snapVideoTracksToGrid(afterDelete, compasGridMarkers) : afterDelete;
+		});
 		setSelectedClipId(null);
-	}, [selectedClipId]);
+	}, [selectedClipId, snapToGrid, compasGridMarkers]);
 
 	const handleDuplicateSelected = useCallback(() => {
 		if (!selectedClipId) return;
-		setTracks((prev) =>
-			prev.map((tr) => {
+		setTracks((prev) => {
+			const next = prev.map((tr) => {
 				if (tr.locked) return tr;
 				const target = tr.clips.find((c) => c.id === selectedClipId);
 				if (!target) return tr;
@@ -282,12 +399,13 @@ export function NleEditorShell({
 					...target,
 					id: makeClipId(target.type),
 					title: `${target.title} (copia)`,
-					startTime: Number((target.startTime + target.duration).toFixed(2)),
+					startTime: Number((target.startTime + target.duration).toFixed(3)),
 				};
 				return { ...tr, clips: [...tr.clips, clone] };
-			})
-		);
-	}, [selectedClipId]);
+			});
+			return snapToGrid ? snapVideoTracksToGrid(next, compasGridMarkers) : next;
+		});
+	}, [selectedClipId, snapToGrid, compasGridMarkers]);
 
 	// Premiere Keyboard Shortcuts (Space, V, C, Delete)
 	useEffect(() => {
@@ -320,8 +438,21 @@ export function NleEditorShell({
 				: prev.find((t) => t.id === 'track-v1') ?? prev.find((t) => t.kind === 'video');
 			if (!targetTrack) return prev;
 
-			// Place right after last clip if overlapping at 0, or right at playhead
-			const startAt = Number(playhead.toFixed(2));
+			// Place right at playhead; when Auto-Compás is active, lock visual clip to exact 1–2s compás slot
+			const rawStart = Number(playhead.toFixed(2));
+			const slotSnap =
+				!isAudio && autoBeatSync && beatCutSlots.length > 0
+					? alignTimeToBeatSlot(rawStart, beatCutSlots)
+					: null;
+			const startAt = slotSnap
+				? slotSnap.startTime
+				: !isAudio && snapToGrid
+				? snapToNearestGridMarker(rawStart, compasGridMarkers, 0)
+				: rawStart;
+			const clipDuration = slotSnap
+				? slotSnap.duration
+				: Math.max(isAudio ? 2 : 1.5, asset.duration || 6);
+
 			const newClip: NleClip = {
 				id: makeClipId(isAudio ? 'aud' : asset.kind),
 				trackId: targetTrack.id,
@@ -330,20 +461,23 @@ export function NleEditorShell({
 				sourceUrl: asset.url,
 				thumbnailUrl: asset.thumbnailUrl,
 				startTime: startAt,
-				duration: Math.max(2, asset.duration || 6),
+				duration: clipDuration,
 				trimStart: 0,
 				opacity: 1,
 				speed: 1,
-				volume: 1,
+				volume: isAudio ? 1 : 0,
 				lutId: 'inherit',
 				colorAdjust: { ...DEFAULT_COLOR_ADJUST },
 				cameraMotion: asset.kind === 'image' ? 'zoom-in' : 'none',
-				transitionIn: isAudio ? 'none' : 'cross-dissolve',
+				transitionIn: isAudio ? 'none' : slotSnap ? 'none' : 'cross-dissolve',
 			};
 			setSelectedClipId(newClip.id);
-			return prev.map((tr) =>
+			const nextTracks = prev.map((tr) =>
 				tr.id === targetTrack.id ? { ...tr, clips: [...tr.clips, newClip] } : tr
 			);
+			return !isAudio && snapToGrid
+				? snapVideoTracksToGrid(nextTracks, compasGridMarkers, targetTrack.id)
+				: nextTracks;
 		});
 	}
 
@@ -422,14 +556,18 @@ export function NleEditorShell({
 	}
 
 	async function handleRegenerateClipImage(clip: NleClip, prompt: string) {
-		const finalPrompt = `${prompt}, 8k resolution, cinematic lighting, photorealistic`.slice(0, 950);
+		const finalPrompt =
+			`${prompt}, photorealistic live-action 35mm cinema still, natural skin texture, motivated cinematic lighting, shallow depth of field, no text, no watermark`.slice(
+				0,
+				950
+			);
 		const res = await createCreation('image', finalPrompt, {
 			size: aspect === '9:16' ? '1024x1536' : '1536x1024',
 		});
 		if (res.error || !res.data?.id) {
 			throw new Error(res.error || 'No se pudo regenerar la imagen.');
 		}
-		for (let i = 0; i < 18; i++) {
+		for (let i = 0; i < 48; i++) {
 			await new Promise((r) => setTimeout(r, 2500));
 			await refreshCreation(res.data.id);
 			const created = await fetchCreation(res.data.id);
@@ -453,16 +591,26 @@ export function NleEditorShell({
 	}
 
 	async function handleAnimateClipToVideo(clip: NleClip, prompt: string) {
-		const finalPrompt = `${prompt}, smooth cinematic motion, high quality`.slice(0, 950);
+		const finalPrompt =
+			`${prompt}. Single unbroken stabilized live-action 35mm take, subtle natural physics and breathing motion, preserve exact frame identity and lighting, no jump cuts, no flicker, no morphing`.slice(
+				0,
+				950
+			);
+		const calibratedMotion = deriveRecommendedMotion(clip.cameraMotion);
 		const res = await createCreation('video', finalPrompt, {
 			aspect: aspect === '21:9' ? '16:9' : aspect,
+			cameraMotion: clip.cameraMotion,
+			motion: calibratedMotion,
+			noise_aug_strength: 0.015,
+			fps: 12,
+			num_frames: 25,
 			reference_image_url: clip.type === 'image' ? clip.sourceUrl : clip.thumbnailUrl,
 		});
 		if (res.error || !res.data?.id) {
 			throw new Error(res.error || 'No se pudo iniciar la animación de video IA.');
 		}
 		onWorkspaceUpdated();
-		for (let i = 0; i < 40; i++) {
+		for (let i = 0; i < 65; i++) {
 			await new Promise((r) => setTimeout(r, 3000));
 			await refreshCreation(res.data.id);
 			const created = await fetchCreation(res.data.id);
@@ -473,6 +621,8 @@ export function NleEditorShell({
 					type: 'video',
 					sourceUrl: videoUrl,
 					thumbnailUrl: created.thumbnail_url ?? c.thumbnailUrl,
+					trimStart: 0,
+					cameraMotion: 'none',
 				}));
 				onWorkspaceUpdated();
 				return;
@@ -572,7 +722,15 @@ export function NleEditorShell({
 				(mx, c) => Math.max(mx, c.startTime + c.duration),
 				0
 			);
-			const startAt = Number((appendToEnd ? maxTrackEnd : playheadRef.current).toFixed(2));
+			const rawStart = Number((appendToEnd ? maxTrackEnd : playheadRef.current).toFixed(2));
+			const slotSnap =
+				!isAudio && autoBeatSync && beatCutSlots.length > 0 && duration > 2.05
+					? alignTimeToBeatSlot(rawStart, beatCutSlots)
+					: null;
+			const startAt = slotSnap ? slotSnap.startTime : rawStart;
+			const clipDur = slotSnap
+				? slotSnap.duration
+				: Math.max(0.5, Number(duration.toFixed(2)));
 			const newClip: NleClip = {
 				id: makeClipId(isAudio ? 'aud' : asset.kind),
 				trackId: targetTrack.id,
@@ -581,103 +739,29 @@ export function NleEditorShell({
 				sourceUrl: asset.url,
 				thumbnailUrl: asset.thumbnailUrl,
 				startTime: startAt,
-				duration: Math.max(0.5, Number(duration.toFixed(2))),
+				duration: clipDur,
 				trimStart: Math.max(0, Number(trimStart.toFixed(2))),
 				opacity: 1,
 				speed: 1,
-				volume: 1,
+				volume: isAudio ? 1 : 0,
 				lutId: 'inherit',
 				colorAdjust: { ...DEFAULT_COLOR_ADJUST },
 				cameraMotion: asset.kind === 'image' ? 'zoom-in' : 'none',
-				transitionIn: isAudio ? 'none' : 'cross-dissolve',
+				transitionIn: isAudio ? 'none' : slotSnap ? 'none' : 'cross-dissolve',
 			};
 			setSelectedClipId(newClip.id);
-			return prev.map((tr) =>
+			const nextTracks = prev.map((tr) =>
 				tr.id === targetTrack.id ? { ...tr, clips: [...tr.clips, newClip] } : tr
 			);
-		});
-	}
-
-	function buildBeatCutClipsFromSources(
-		sources: {
-			title: string;
-			type: 'video' | 'image';
-			sourceUrl: string;
-			thumbnailUrl?: string;
-			startTime: number;
-			endTime: number;
-			aiPrompt?: string;
-		}[],
-		slots: MusicalCutSlot[]
-	): NleClip[] {
-		if (sources.length === 0 || slots.length === 0) return [];
-		const uniquePool: typeof sources = [];
-		const seenUrls = new Set<string>();
-		for (const s of sources) {
-			if (!s.sourceUrl || seenUrls.has(s.sourceUrl)) continue;
-			seenUrls.add(s.sourceUrl);
-			uniquePool.push(s);
-		}
-		if (uniquePool.length === 0) return [];
-
-		const motions: NleClip['cameraMotion'][] = ['zoom-in', 'pan-right', 'zoom-out', 'pan-left'];
-		const maxEnd = Math.max(1, sources[sources.length - 1]?.endTime ?? 45);
-		let lastUrl = '';
-
-		return slots.map((slot) => {
-			const mid = (slot.startTime + slot.endTime) / 2;
-			let primaryIdx = sources.findIndex((s) => mid >= s.startTime && mid <= s.endTime);
-			if (primaryIdx < 0) {
-				primaryIdx = Math.min(sources.length - 1, Math.floor((mid / maxEnd) * sources.length));
-			}
-			const primary = sources[primaryIdx] ?? uniquePool[0];
-			const primaryPoolIdx = Math.max(
-				0,
-				uniquePool.findIndex((u) => u.sourceUrl === primary.sourceUrl)
-			);
-
-			let chosen =
-				slot.cutIndex % 2 === 0
-					? primary
-					: uniquePool[(primaryPoolIdx + 1 + Math.floor(slot.cutIndex / 2)) % uniquePool.length];
-
-			if (chosen.sourceUrl === lastUrl && uniquePool.length > 1) {
-				const curIdx = Math.max(
-					0,
-					uniquePool.findIndex((u) => u.sourceUrl === chosen.sourceUrl)
-				);
-				chosen = uniquePool[(curIdx + 1) % uniquePool.length];
-			}
-			lastUrl = chosen.sourceUrl;
-
-			const cleanTitle = chosen.title.replace(/\s*·\s*C\d+$/i, '');
-			const safeTrimStart =
-				chosen.type === 'video' && slot.duration <= 1.75 && slot.cutIndex % 4 >= 2 ? 0.25 : 0;
-
-			return {
-				id: makeClipId(chosen.type === 'video' ? 'vid' : 'img'),
-				trackId: 'track-v1',
-				type: chosen.type,
-				title: `${cleanTitle} · C${slot.cutIndex + 1}`,
-				sourceUrl: chosen.sourceUrl,
-				thumbnailUrl: chosen.thumbnailUrl,
-				startTime: slot.startTime,
-				duration: slot.duration,
-				trimStart: safeTrimStart,
-				opacity: 1,
-				speed: 1,
-				volume: 0,
-				lutId: 'inherit',
-				colorAdjust: { ...DEFAULT_COLOR_ADJUST },
-				cameraMotion: motions[slot.cutIndex % motions.length],
-				transitionIn: slot.isVocalEntryBoundary ? 'cross-dissolve' : 'none',
-				aiPrompt: chosen.aiPrompt,
-			};
+			return !isAudio && snapToGrid
+				? snapVideoTracksToGrid(nextTracks, compasGridMarkers, targetTrack.id)
+				: nextTracks;
 		});
 	}
 
 	function handleAssembleMaestroPlan(plan: MaestroPlan) {
 		setProjectTitle(plan.title);
+		setBeatAnalysis(plan.analysis);
 
 		const sceneSources = plan.scenes
 			.filter((sc) => Boolean(sc.videoUrl || sc.imageUrl))
@@ -694,12 +778,14 @@ export function NleEditorShell({
 		const beatSlots = buildMusicalCutGrid({
 			duration: plan.analysis.duration,
 			bpm: plan.analysis.estimatedBpm,
+			beatOffset: plan.analysis.beatOffset,
+			energyBins: plan.analysis.energyBins,
 			vocalEntryTime: plan.analysis.vocalEntryTime,
 			peakHookStart: plan.analysis.peakHookStart,
 			peakHookEnd: plan.analysis.peakHookEnd,
 		});
 
-		const visualClips = buildBeatCutClipsFromSources(sceneSources, beatSlots);
+		const visualClips = buildDynamicBeatClips(sceneSources, beatSlots, 'track-v1');
 
 		const vocalEntry = plan.analysis.vocalEntryTime ?? 0;
 		const textClips: NleClip[] = plan.scenes
@@ -795,10 +881,17 @@ export function NleEditorShell({
 				totalDuration
 		);
 
-		const analysis = await analyzeAudioTrack(audioUrl, targetDur, songMatch?.lyrics);
+		const analysis =
+			beatAnalysis && Math.abs(beatAnalysis.duration - targetDur) <= 1.5
+				? beatAnalysis
+				: await analyzeAudioTrack(audioUrl, targetDur, songMatch?.lyrics);
+		setBeatAnalysis(analysis);
+
 		const slots = buildMusicalCutGrid({
 			duration: targetDur,
 			bpm: analysis.estimatedBpm,
+			beatOffset: analysis.beatOffset,
+			energyBins: analysis.energyBins,
 			vocalEntryTime: analysis.vocalEntryTime,
 			peakHookStart: analysis.peakHookStart,
 			peakHookEnd: analysis.peakHookEnd,
@@ -814,7 +907,7 @@ export function NleEditorShell({
 			aiPrompt: c.aiPrompt,
 		}));
 
-		const beatClips = buildBeatCutClipsFromSources(sources, slots);
+		const beatClips = buildDynamicBeatClips(sources, slots, v1Track?.id ?? 'track-v1');
 		if (beatClips.length === 0) return;
 
 		setTracks((prev) =>
@@ -825,6 +918,20 @@ export function NleEditorShell({
 		setSelectedClipId(beatClips[0]?.id ?? null);
 		setPlayhead(0);
 		setSeekVersion((v) => v + 1);
+	}
+
+	function handleToggleAutoBeatSync() {
+		setAutoBeatSync((prev) => {
+			const next = !prev;
+			if (next) {
+				const v1 = tracks.find((t) => t.id === 'track-v1') ?? tracks.find((t) => t.kind === 'video');
+				const hasLongClips = (v1?.clips ?? []).some((c) => Boolean(c.sourceUrl) && c.duration > 2.15);
+				if (hasLongClips) {
+					void handleBeatCutTimeline();
+				}
+			}
+			return next;
+		});
 	}
 
 	async function handleMagicDetectTitles() {
@@ -1080,10 +1187,16 @@ export function NleEditorShell({
 						handleDuplicateSelected();
 					}}
 					onSplitClip={(id) => {
-						setTracks((prev) => splitClipAtTime(prev, id, playheadRef.current));
+						const splitAt = snapToGrid
+							? snapToNearestGridMarker(playheadRef.current, compasGridMarkers, 0)
+							: playheadRef.current;
+						setTracks((prev) => splitClipAtTime(prev, id, splitAt));
 					}}
 					onDeleteClip={(id) => {
-						setTracks((prev) => deleteClipFromTracks(prev, id));
+						setTracks((prev) => {
+							const afterDelete = deleteClipFromTracks(prev, id);
+							return snapToGrid ? snapVideoTracksToGrid(afterDelete, compasGridMarkers) : afterDelete;
+						});
 						if (selectedClipId === id) setSelectedClipId(null);
 					}}
 					onRegenerateClipImage={handleRegenerateClipImage}
@@ -1099,6 +1212,19 @@ export function NleEditorShell({
 				totalDuration={totalDuration}
 				selectedClipId={selectedClipId}
 				toolMode={toolMode}
+				beatBpm={beatAnalysis?.estimatedBpm ?? null}
+				beatCutSlots={beatCutSlots}
+				beatTimes={beatAnalysis?.beatTimes ?? []}
+				barTimes={beatAnalysis?.barTimes ?? []}
+				vocalEntryTime={beatAnalysis?.vocalEntryTime ?? null}
+				peakHookStart={beatAnalysis?.peakHookStart ?? null}
+				peakHookEnd={beatAnalysis?.peakHookEnd ?? null}
+				autoBeatSync={autoBeatSync}
+				snapToGrid={snapToGrid}
+				onToggleAutoBeatSync={handleToggleAutoBeatSync}
+				onToggleSnapToGrid={handleToggleSnapToGrid}
+				onSnapTrackToGrid={handleSnapTrackToGrid}
+				onGridTrimClip={handleGridTrimClip}
 				onToolModeChange={setToolMode}
 				onSelectClip={setSelectedClipId}
 				onSeek={(tSec) => seekPlayhead(tSec, totalDuration)}

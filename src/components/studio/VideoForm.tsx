@@ -24,7 +24,7 @@ import { type Creation, type StudioSong, type VideoSource } from '@/lib/studio';
 import type { ProviderInfo } from '@/components/studio/StudioForm';
 import { CHARACTERS } from '@/lib/characters';
 import { CinematicTimelineEditor } from '@/components/studio/CinematicTimelineEditor';
-import { magicEnhancePrompt } from '@/lib/nle/maestroDirector';
+import { magicEnhancePromptDetailed } from '@/lib/nle/maestroDirector';
 import {
 	AUTEUR_DIRECTORS,
 	FILM_GENRES,
@@ -37,6 +37,7 @@ import {
 	MV_STYLES,
 	MV_VIBES,
 	buildMusicVideoPrompt,
+	deriveRecommendedMotion,
 	type MusicVideoKind,
 	type MusicVideoMode,
 } from '@/lib/music-video/presets';
@@ -112,6 +113,8 @@ export function VideoForm({
 	const [extra, setExtra] = useState(initialExtra);
 	const [isEnhancingPrompt, setIsEnhancingPrompt] = useState(false);
 	const [enhanceError, setEnhanceError] = useState<string | null>(null);
+	const [recommendedMotion, setRecommendedMotion] = useState<number | null>(null);
+	const [continuityHint, setContinuityHint] = useState<string | null>(null);
 
 	// Cinema / Film specific options
 	const [filmGenre, setFilmGenre] = useState<string>(FILM_GENRES[0]);
@@ -267,8 +270,15 @@ export function VideoForm({
 		if (isEnhancingPrompt) return;
 		setIsEnhancingPrompt(true);
 		setEnhanceError(null);
+		setContinuityHint(null);
 		try {
-			const enhanced = await magicEnhancePrompt(
+			const previousVideos = creations
+				.filter((c) => c.kind === 'video' && (c.status === 'ready' || c.status === 'generating'))
+				.slice(0, 6)
+				.map((c) => `${c.title ? `${c.title}: ` : ''}${c.prompt}`.slice(0, 200))
+				.filter(Boolean);
+
+			const enhanced = await magicEnhancePromptDetailed(
 				extra.trim() || scriptScene.trim() || `${selectedStyle} scene in ${selectedBg}`,
 				{
 					mode: 'video-prompt',
@@ -276,6 +286,9 @@ export function VideoForm({
 					character: selectedChar,
 					format: productionCategory === 'cinema' ? 'short-film' : 'music-video',
 					songTitle: song?.title || upload?.title || '',
+					cameraMotion,
+					hasStartImage: Boolean(startImageUrl),
+					previousVideos,
 					sceneContext: [
 						`Category: ${productionCategory}`,
 						`Background: ${selectedBg}`,
@@ -287,7 +300,15 @@ export function VideoForm({
 						.join('. '),
 				}
 			);
-			setExtra(enhanced.slice(0, 500));
+			setExtra(enhanced.prompt.slice(0, 500));
+			if (typeof enhanced.recommendedMotion === 'number') {
+				setRecommendedMotion(enhanced.recommendedMotion);
+			}
+			if (enhanced.continuityNote) {
+				setContinuityHint(enhanced.continuityNote);
+			} else if (previousVideos.length > 0) {
+				setContinuityHint(`Continuidad calibrada con ${previousVideos.length} video(s) previo(s).`);
+			}
 		} catch (err) {
 			setEnhanceError(err instanceof Error ? err.message : 'No se pudo mejorar el prompt con IA.');
 		} finally {
@@ -333,6 +354,8 @@ export function VideoForm({
 			scriptScene: productionCategory === 'cinema' ? scriptScene : undefined,
 		});
 
+		const calibratedMotion = recommendedMotion ?? deriveRecommendedMotion(cameraMotion, actorFraming);
+
 		onSubmit(compiledPrompt, {
 			style: selectedStyle,
 			aspect: aspect === '21:9' ? '16:9' : aspect,
@@ -343,6 +366,10 @@ export function VideoForm({
 			character: selectedChar,
 			background: selectedBg,
 			cameraMotion,
+			motion: calibratedMotion,
+			noise_aug_strength: 0.015,
+			fps: 12,
+			num_frames: 25,
 			lipSync,
 			lipSyncMode,
 			sfxEnabled,
@@ -1097,6 +1124,9 @@ export function VideoForm({
 					</div>
 					{enhanceError && (
 						<p className="text-[11px] text-destructive">{enhanceError}</p>
+					)}
+					{continuityHint && !enhanceError && (
+						<p className="text-[11px] text-cyan-300">{continuityHint}</p>
 					)}
 
 					<textarea

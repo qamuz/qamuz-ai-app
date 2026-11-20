@@ -17,6 +17,7 @@ import { supabase } from '@/integrations/supabase/client';
 import { fetchArtistAlbums, fetchArtistBySlug, fetchArtistTracks } from '@/lib/queries';
 import { coverUrl } from '@/lib/covers';
 import { formatCount } from '@/lib/format';
+import { sanitizeExternalUrl } from '@/lib/safeUrl';
 import type { Album, Artist, TrackWithArtist } from '@/types/music';
 
 export default function ArtistPage() {
@@ -117,11 +118,15 @@ export default function ArtistPage() {
 							{artist.bio && <p data-ev-id="ev_17b74412b7" className="max-w-xl text-sm text-pretty text-muted-foreground">{artist.bio}</p>}
 							{Object.entries(artist.social_links ?? {}).length > 0 &&
             <div data-ev-id="ev_83bcbc57d2" className="flex w-full flex-wrap gap-2">
-									{Object.entries(artist.social_links ?? {}).map(([key, url]) =>
-              <a data-ev-id="ev_be63cc1e45" key={key} href={url} target="_blank" rel="noreferrer" className="inline-flex min-h-9 items-center gap-1.5 rounded-lg border border-border px-3 text-xs font-semibold text-muted-foreground transition-colors hover:text-foreground">
+									{Object.entries(artist.social_links ?? {}).map(([key, url]) => {
+                const safeHref = sanitizeExternalUrl(url);
+                if (!safeHref) return null;
+                return (
+                  <a data-ev-id="ev_be63cc1e45" key={key} href={safeHref} target="_blank" rel="noopener noreferrer" className="inline-flex min-h-9 items-center gap-1.5 rounded-lg border border-border px-3 text-xs font-semibold text-muted-foreground transition-colors hover:text-foreground">
 											{SOCIAL_LABEL[key] ? t(SOCIAL_LABEL[key]) : key} <ExternalLink className="h-3 w-3" />
 										</a>
-              )}
+                );
+              })}
 								</div>
             }
 						</div>

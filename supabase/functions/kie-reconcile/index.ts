@@ -60,7 +60,16 @@ async function markError(admin: SupabaseClient, table: string, id: string, messa
 
 async function refundCreation(admin: SupabaseClient, creation: Row, message: string) {
 	if (!(await markError(admin, 'ai_creations', creation.id, message))) return;
-	if (creation.credits_spent > 0) await addCredits(admin, creation.user_id, creation.credits_spent, 'Reembolso por error', creation.id);
+	if (creation.credits_spent <= 0) return;
+	const { data: debit } = await admin
+		.from('credit_transactions')
+		.select('amount')
+		.eq('user_id', creation.user_id)
+		.eq('creation_id', creation.id)
+		.lt('amount', 0)
+		.maybeSingle();
+	const verifiedRefund = debit ? Math.min(creation.credits_spent, Math.abs(Number(debit.amount))) : 0;
+	if (verifiedRefund > 0) await addCredits(admin, creation.user_id, verifiedRefund, 'Reembolso por error', creation.id);
 }
 
 async function failStem(admin: SupabaseClient, job: Row, message: string) {

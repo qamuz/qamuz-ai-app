@@ -6,6 +6,7 @@ import { useAuth } from '@/hooks/useAuth';
 import { useAccount } from '@/hooks/useAccount';
 import { uploadMedia } from '@/lib/media';
 import { coverUrl } from '@/lib/covers';
+import { sanitizeExternalUrl } from '@/lib/safeUrl';
 import type { OwnedArtist } from '@/contexts/account-context';
 import { Field, Notice, PrimaryButton, TextArea, TextInput } from '@/components/ui/Field';
 import { ArtistImageModal } from '@/components/artist/ArtistImageModal';
@@ -79,7 +80,18 @@ export function ArtistProfileForm({ artist }: { artist: OwnedArtist }) {
 		if (!supabase) return;
 		setBusy(true);
 		setStatus(null);
-		const cleaned = Object.fromEntries(Object.entries(socials).filter(([, v]) => v.trim()));
+		const cleaned: Record<string, string> = {};
+		for (const [key, rawVal] of Object.entries(socials)) {
+			const trimmed = rawVal.trim();
+			if (!trimmed) continue;
+			const safe = sanitizeExternalUrl(trimmed);
+			if (!safe) {
+				setBusy(false);
+				setStatus({ tone: 'error', text: `Enlace inválido en ${key}. Usa únicamente URLs https:// o http://.` });
+				return;
+			}
+			cleaned[key] = safe;
+		}
 		const { error } = await supabase
 			.from('artists')
 			.update({

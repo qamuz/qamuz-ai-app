@@ -176,24 +176,21 @@ export async function fetchProviders(): Promise<ProviderInfo[]> {
 		.order('created_at');
 	const list = (data as ProviderInfo[] | null) ?? [];
 
-	// Prefer Modal (modal-image / modal-video) as active defaults when present
+	// Prefer Modal (modal-image / modal-video) locally when present without issuing write side-effects
 	const hasModalImage = list.some((p) => p.slug === 'modal-image');
 	const hasActiveVideo = list.some((p) => p.kind === 'video' && p.is_active);
 	for (const p of list) {
 		if (p.slug === 'modal-image' && (!p.is_active || !p.is_default)) {
 			p.is_active = true;
 			p.is_default = true;
-			void supabase.from('ai_providers').update({ is_active: true, is_default: true }).eq('id', p.id);
 		}
 		if (!hasActiveVideo && p.slug === 'modal-video') {
 			p.is_active = true;
 			p.is_default = true;
-			void supabase.from('ai_providers').update({ is_active: true, is_default: true }).eq('id', p.id);
 		}
 		if (hasModalImage && p.slug === 'openai-image' && (p.is_active || p.is_default)) {
 			p.is_active = false;
 			p.is_default = false;
-			void supabase.from('ai_providers').update({ is_active: false, is_default: false }).eq('id', p.id);
 		}
 	}
 

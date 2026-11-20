@@ -13,6 +13,7 @@ import {
 	ExternalLink,
 	Eye,
 	Film,
+	Grid3x3,
 	Layers,
 	Loader2,
 	Maximize2,
@@ -43,6 +44,11 @@ import { formatTime } from '@/lib/format';
 import { uploadMedia } from '@/lib/media';
 import { createCreation, fetchCreation, refreshCreation, saveRenderedVideo, type StudioSong } from '@/lib/studio';
 import { generateYoutubeSeo } from '@/lib/nle/maestroDirector';
+import {
+	analyzeAudioTrack,
+	buildMusicalCutGrid,
+	type AudioAnalysisResult,
+} from '@/lib/nle/audioAnalyzer';
 import {
 	COLOR_GRADE_PRESETS,
 	buildTimelineTracks,
@@ -91,17 +97,123 @@ export function CinematicTimelineEditor({
 	const [tracks, setTracks] = useState<TimelineTrack[]>(() => buildTimelineTracks(song, scenes));
 	const [selectedClipId, setSelectedClipId] = useState<string | null>(null);
 
-	// Playback State
+	// Playback & Beat/Compás State
 	const [isPlaying, setIsPlaying] = useState(false);
 	const [currentTime, setCurrentTime] = useState(0);
+	const [beatAnalysis, setBeatAnalysis] = useState<AudioAnalysisResult | null>(null);
+	const [syncingBeat, setSyncingBeat] = useState(false);
+	const [showBeatGrid, setShowBeatGrid] = useState(true);
 	const totalDuration = useMemo(
 		() => Math.max(song.duration || 60, scenes.reduce((max, s) => Math.max(max, s.endTime), 0)),
 		[song.duration, scenes]
 	);
 
+	const playheadBarBeat = useMemo(() => {
+		const bars = beatAnalysis?.barTimes ?? [];
+		if (bars.length === 0) return null;
+		let barIdx = 0;
+		for (let i = 0; i < bars.length; i++) {
+			if (currentTime >= bars[i] - 0.03) barIdx = i;
+			else break;
+		}
+		const barStart = bars[barIdx] ?? 0;
+		const beatSec = beatAnalysis?.estimatedBpm ? 60 / beatAnalysis.estimatedBpm : 0.5;
+		const beatInBar = Math.min(4, Math.max(1, Math.floor(Math.max(0, currentTime - barStart) / beatSec) + 1));
+		return { bar: barIdx + 1, beat: beatInBar };
+	}, [beatAnalysis, currentTime]);
+
 	// Audio element for playing the song synchronized with the timeline
 	const audioRef = useRef<HTMLAudioElement | null>(null);
 	const animationFrameRef = useRef<number | null>(null);
+	const autoSyncedOnceRef = useRef(false);
+
+	// Helper to cut/distribute scenes dynamically onto exact 1.0–2.0s compás slots
+	function applyBeatCutScenes(
+		baseScenes: StoryboardScene[],
+		analysis: AudioAnalysisResult
+	): StoryboardScene[] {
+		if (baseScenes.length === 0) return baseScenes;
+		const targetDur = Math.max(8, song.duration || analysis.duration || 60);
+		const slots = buildMusicalCutGrid({
+			duration: targetDur,
+			bpm: analysis.estimatedBpm,
+			beatOffset: analysis.beatOffset,
+			energyBins: analysis.energyBins,
+			vocalEntryTime: analysis.vocalEntryTime,
+			peakHookStart: analysis.peakHookStart,
+			peakHookEnd: analysis.peakHookEnd,
+		});
+		if (slots.length === 0) return baseScenes;
+
+		// Preserve unique narrative scenes as pool
+		const pool: StoryboardScene[] = [];
+		const seenKeys = new Set<string>();
+		for (const sc of baseScenes) {
+			const k = sc.visualPrompt || sc.title;
+			if (seenKeys.has(k)) continue;
+			seenKeys.add(k);
+			pool.push(sc);
+		}
+		const sourcePool = pool.length > 0 ? pool : baseScenes;
+		let lastPoolIdx = -1;
+
+		return slots.map((slot, idx) => {
+			const ratio = (slot.startTime + slot.endTime) / 2 / Math.max(1, targetDur);
+			const primaryIdx = Math.min(sourcePool.length - 1, Math.floor(ratio * sourcePool.length));
+			let pickIdx =
+				idx % 2 === 0 ? primaryIdx : (primaryIdx + 1 + Math.floor(idx / 2)) % sourcePool.length;
+			if (pickIdx === lastPoolIdx && sourcePool.length > 1) {
+				pickIdx = (pickIdx + 1) % sourcePool.length;
+			}
+			lastPoolIdx = pickIdx;
+			const base = sourcePool[pickIdx];
+			const cleanTitle = base.title.replace(/\s*·\s*C\d+$/i, '');
+
+			return {
+				...base,
+				id: `scene-cut-${idx + 1}-${slot.startTime}`,
+				sceneNumber: idx + 1,
+				title: `${cleanTitle} · C${idx + 1}`,
+				startTime: slot.startTime,
+				endTime: slot.endTime,
+				duration: slot.duration,
+				transition: slot.isVocalEntryBoundary ? 'disolvencia' : 'corte',
+			};
+		});
+	}
+
+	// Automatically analyze audio compás on mount and apply 1–2s rhythmic cuts once
+	useEffect(() => {
+		let cancelled = false;
+		void analyzeAudioTrack(song.audioUrl || '', song.duration || 60, song.lyrics).then((analysis) => {
+			if (cancelled) return;
+			setBeatAnalysis(analysis);
+			if (!autoSyncedOnceRef.current) {
+				autoSyncedOnceRef.current = true;
+				setScenes((prev) => {
+					const cut = applyBeatCutScenes(prev, analysis);
+					setTracks(buildTimelineTracks(song, cut));
+					return cut;
+				});
+			}
+		});
+		return () => {
+			cancelled = true;
+		};
+	}, [song.audioUrl, song.duration, song.lyrics]); // eslint-disable-line react-hooks/exhaustive-deps
+
+	// Pre-decode all unique scene images into GPU memory so 1–2s cuts never flicker
+	useEffect(() => {
+		const urls = Array.from(new Set(scenes.map((s) => s.imageUrl).filter(Boolean)));
+		for (const url of urls) {
+			const img = new Image();
+			img.decoding = 'async';
+			img.src = url;
+			if (typeof img.decode === 'function') {
+				void img.decode().catch(() => undefined);
+			}
+		}
+	}, [scenes]);
 
 	// Color Grading & Effects State
 	const [selectedColorGrade, setSelectedColorGrade] = useState<string>(COLOR_GRADE_PRESETS[1].id);
@@ -176,10 +288,17 @@ export function CinematicTimelineEditor({
 		};
 	}, [isPlaying, totalDuration]); // eslint-disable-line react-hooks/exhaustive-deps
 
-	// Active scene at currentTime
-	const activeScene = useMemo(() => {
-		const match = scenes.find((s) => currentTime >= s.startTime && currentTime <= s.endTime);
-		return match || scenes[0];
+	// Active & previous scene at currentTime (gap-immune so rapid 1–2s cuts never flash black)
+	const { activeScene, previousScene } = useMemo(() => {
+		if (scenes.length === 0) return { activeScene: scenes[0], previousScene: null as StoryboardScene | null };
+		let idx = scenes.findIndex((s) => currentTime >= s.startTime && currentTime < s.endTime);
+		if (idx < 0) {
+			idx = currentTime >= (scenes[scenes.length - 1]?.startTime ?? 0) ? scenes.length - 1 : 0;
+		}
+		return {
+			activeScene: scenes[idx] || scenes[0],
+			previousScene: idx > 0 ? scenes[idx - 1] : null,
+		};
 	}, [scenes, currentTime]);
 
 	// Active color grade preset
@@ -203,25 +322,19 @@ export function CinematicTimelineEditor({
 		}
 	}
 
-	function handleAutoSync() {
-		const sceneCount = scenes.length;
-		const sceneDuration = totalDuration / sceneCount;
-		let cursor = 0;
-
-		const resyncedScenes = scenes.map((sc, i) => {
-			const start = cursor;
-			const end = i === sceneCount - 1 ? totalDuration : start + sceneDuration;
-			cursor = end;
-			return {
-				...sc,
-				startTime: Math.round(start * 10) / 10,
-				endTime: Math.round(end * 10) / 10,
-				duration: Math.round((end - start) * 10) / 10,
-			};
-		});
-
-		setScenes(resyncedScenes);
-		setTracks(buildTimelineTracks(song, resyncedScenes));
+	async function handleAutoSync() {
+		setSyncingBeat(true);
+		try {
+			const analysis =
+				beatAnalysis ??
+				(await analyzeAudioTrack(song.audioUrl || '', song.duration || totalDuration, song.lyrics));
+			setBeatAnalysis(analysis);
+			const resyncedScenes = applyBeatCutScenes(scenes, analysis);
+			setScenes(resyncedScenes);
+			setTracks(buildTimelineTracks(song, resyncedScenes));
+		} finally {
+			setSyncingBeat(false);
+		}
 	}
 
 	function openSceneEditor(sc: StoryboardScene) {
@@ -581,12 +694,19 @@ export function CinematicTimelineEditor({
 				<div className="flex items-center gap-2">
 					<button
 						type="button"
-						onClick={handleAutoSync}
-						className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-primary/30 bg-primary/10 text-primary text-xs font-bold hover:bg-primary hover:text-black transition-all"
-						title="Sincroniza la duración de cada escena al ritmo exacto de la canción"
+						disabled={syncingBeat}
+						onClick={() => void handleAutoSync()}
+						className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-primary/30 bg-primary/10 text-primary text-xs font-bold hover:bg-primary hover:text-black transition-all disabled:opacity-50"
+						title="Corta y sincroniza cada escena cada 1–2s al ritmo exacto del compás"
 					>
 						<Wand2 className="h-3.5 w-3.5" />
-						<span>Auto-Sincronizar Beat</span>
+						<span>
+							{syncingBeat
+								? 'Sincronizando...'
+								: beatAnalysis
+								? `Compás ${Math.round(beatAnalysis.estimatedBpm)} BPM (1-2s)`
+								: 'Auto-Sincronizar Beat'}
+						</span>
 					</button>
 
 					<button
@@ -653,13 +773,27 @@ export function CinematicTimelineEditor({
 							<div className="absolute inset-0 pointer-events-none z-20 shadow-[inset_0_0_80px_rgba(0,0,0,0.8)]" />
 						)}
 
-						{/* Active Scene Still Frame */}
-						<img
-							src={activeScene.imageUrl}
-							alt={activeScene.title}
-							style={{ filter: activeFilter.cssFilter }}
-							className="h-full w-full object-contain transition-all duration-300"
-						/>
+						{/* Zero-Flicker Double-Buffered Scene Preview */}
+						{previousScene?.imageUrl && (
+							<img
+								key={`prev-${previousScene.id}`}
+								src={previousScene.imageUrl}
+								alt=""
+								decoding="async"
+								style={{ filter: activeFilter.cssFilter }}
+								className="absolute inset-0 h-full w-full object-contain z-[1] pointer-events-none"
+							/>
+						)}
+						{activeScene?.imageUrl && (
+							<img
+								key={`act-${activeScene.id}`}
+								src={activeScene.imageUrl}
+								alt={activeScene.title}
+								decoding="async"
+								style={{ filter: activeFilter.cssFilter }}
+								className="relative z-[2] h-full w-full object-contain will-change-transform"
+							/>
+						)}
 
 						{/* Scene Overlay HUD */}
 						<div className="absolute top-3 left-3 z-30 flex items-center gap-2">
@@ -848,48 +982,134 @@ export function CinematicTimelineEditor({
 			</div>
 
 			{/* Bottom Workspace: Multitrack Timeline (Filmora Style) */}
-			<div className="h-56 border-t border-border/80 bg-[#121217] flex flex-col min-h-0 flex-none p-3">
-				{/* Timeline Ruler */}
-				<div
-					onClick={handleTimelineClick}
-					className="relative h-6 bg-[#0e0e13] rounded-t-lg border border-border/60 cursor-pointer overflow-hidden flex items-center"
-				>
-					{/* Ruler marks */}
-					{Array.from({ length: Math.ceil(totalDuration / 10) + 1 }).map((_, i) => {
-						const markSeconds = i * 10;
-						const leftPercent = (markSeconds / totalDuration) * 100;
-						if (leftPercent > 100) return null;
-						return (
-							<div
-								key={i}
-								style={{ left: `${leftPercent}%` }}
-								className="absolute top-0 bottom-0 flex flex-col justify-between pl-1 border-l border-white/20 text-[9px] font-mono text-muted-foreground pointer-events-none"
-							>
-								<span>{formatTime(markSeconds)}</span>
-							</div>
-						);
-					})}
-
-					{/* Playhead Indicator in Ruler */}
-					<div
-						style={{ left: `${(currentTime / totalDuration) * 100}%` }}
-						className="absolute top-0 bottom-0 w-0.5 bg-primary z-40 pointer-events-none"
+			<div className="h-60 border-t border-border/80 bg-[#121217] flex flex-col min-h-0 flex-none p-3">
+				{/* Timeline Header Strip with Compás Grid Toggle & Live Bar.Beat Readout */}
+				<div className="flex items-center justify-between gap-2 pb-1.5 text-[10px]">
+					<div className="flex items-center gap-2 font-mono tabular-nums">
+						<span className="font-bold text-primary">{formatTime(currentTime)}</span>
+						{playheadBarBeat && (
+							<span className="rounded bg-amber-400/15 px-1.5 py-0.5 font-bold text-amber-300 border border-amber-400/30">
+								Compás {playheadBarBeat.bar} · Tiempo {playheadBarBeat.beat}
+							</span>
+						)}
+						{beatAnalysis && (
+							<span className="text-muted-foreground">
+								{Math.round(beatAnalysis.estimatedBpm)} BPM · {beatAnalysis.barTimes.length} compases
+							</span>
+						)}
+					</div>
+					<button
+						type="button"
+						onClick={() => setShowBeatGrid((v) => !v)}
+						className={`inline-flex items-center gap-1 rounded border px-2 py-0.5 text-[10px] font-bold transition-colors ${
+							showBeatGrid
+								? 'border-amber-400/50 bg-amber-400/15 text-amber-300'
+								: 'border-border bg-surface-2 text-muted-foreground hover:text-foreground'
+						}`}
 					>
-						<div className="w-3 h-3 bg-primary rounded-full -translate-x-[5px] -translate-y-1 shadow-md shadow-primary/60" />
+						<Grid3x3 className="h-3 w-3" />
+						<span>{showBeatGrid ? 'Rejilla Compases ON' : 'Rejilla Compases OFF'}</span>
+					</button>
+				</div>
+
+				{/* Timeline Timecode & Compás Ruler (aligned with w-20 track headers) */}
+				<div className="flex h-7 bg-[#0e0e13] rounded-t-lg border border-border/60 overflow-hidden">
+					<div className="w-20 flex-none border-r border-border/50 px-2 flex items-center justify-between text-[9px] font-mono text-amber-300/90 font-bold">
+						<span>COMPÁS</span>
+						<span className="text-[8px] opacity-70">4/4</span>
+					</div>
+					<div
+						onClick={handleTimelineClick}
+						className="relative flex-1 cursor-pointer overflow-hidden flex items-center"
+					>
+						{/* Peak / Chorus Band */}
+						{showBeatGrid &&
+							beatAnalysis &&
+							beatAnalysis.peakHookEnd > beatAnalysis.peakHookStart && (
+								<div
+									style={{
+										left: `${(beatAnalysis.peakHookStart / totalDuration) * 100}%`,
+										width: `${((beatAnalysis.peakHookEnd - beatAnalysis.peakHookStart) / totalDuration) * 100}%`,
+									}}
+									title={`Coro / Pico (${formatTime(beatAnalysis.peakHookStart)}–${formatTime(beatAnalysis.peakHookEnd)})`}
+									className="pointer-events-none absolute top-0 h-1 bg-cyan-400/75"
+								/>
+							)}
+
+						{/* Timecode marks */}
+						{Array.from({ length: Math.ceil(totalDuration / 10) + 1 }).map((_, i) => {
+							const markSeconds = i * 10;
+							const leftPercent = (markSeconds / totalDuration) * 100;
+							if (leftPercent > 100) return null;
+							return (
+								<div
+									key={i}
+									style={{ left: `${leftPercent}%` }}
+									className="absolute top-0 bottom-0 flex flex-col justify-start pl-1 border-l border-white/15 text-[8px] font-mono text-muted-foreground pointer-events-none"
+								>
+									<span>{formatTime(markSeconds)}</span>
+								</div>
+							);
+						})}
+
+						{/* Detected Compás Downbeat Markers (clickable to seek to exact compás) */}
+						{showBeatGrid &&
+							beatAnalysis?.barTimes.map((barT, idx) => {
+								const leftPercent = (barT / totalDuration) * 100;
+								if (leftPercent > 100) return null;
+								const labelEvery = beatAnalysis.barTimes.length > 32 ? 4 : beatAnalysis.barTimes.length > 16 ? 2 : 1;
+								return (
+									<button
+										key={`cbar-${idx}`}
+										type="button"
+										onClick={(e) => {
+											e.stopPropagation();
+											setCurrentTime(barT);
+											if (audioRef.current) audioRef.current.currentTime = barT;
+										}}
+										title={`Compás ${idx + 1} (${formatTime(barT)})`}
+										style={{ left: `${leftPercent}%` }}
+										className="absolute bottom-0 h-3.5 border-l border-amber-400/75 pl-0.5 text-[8px] font-mono font-bold text-amber-300 hover:text-amber-200 leading-none flex items-end pb-0.5"
+									>
+										{idx % labelEvery === 0 ? `C${idx + 1}` : ''}
+									</button>
+								);
+							})}
+
+						{/* Vocal Entry Marker */}
+						{showBeatGrid &&
+							beatAnalysis &&
+							beatAnalysis.vocalEntryTime > 0.3 &&
+							beatAnalysis.vocalEntryTime < totalDuration && (
+								<button
+									type="button"
+									onClick={(e) => {
+										e.stopPropagation();
+										setCurrentTime(beatAnalysis.vocalEntryTime);
+										if (audioRef.current) audioRef.current.currentTime = beatAnalysis.vocalEntryTime;
+									}}
+									title={`Entrada vocal (${formatTime(beatAnalysis.vocalEntryTime)})`}
+									style={{ left: `${(beatAnalysis.vocalEntryTime / totalDuration) * 100}%` }}
+									className="absolute top-0 bottom-0 z-20 border-l-2 border-emerald-400 bg-emerald-500/20 px-1 text-[8px] font-black text-emerald-300 flex items-center"
+								>
+									VOZ
+								</button>
+							)}
+
+						{/* Playhead Indicator in Ruler */}
+						<div
+							style={{ left: `${(currentTime / totalDuration) * 100}%` }}
+							className="absolute top-0 bottom-0 w-0.5 bg-primary z-40 pointer-events-none"
+						>
+							<div className="w-3 h-3 bg-primary rounded-full -translate-x-[5px] -translate-y-1 shadow-md shadow-primary/60" />
+						</div>
 					</div>
 				</div>
 
 				{/* Multitrack Channels Workspace */}
 				<div
-					onClick={handleTimelineClick}
-					className="relative flex-1 bg-[#101015] rounded-b-lg border-x border-b border-border/60 overflow-y-auto no-scrollbar flex flex-col p-1 gap-1 cursor-pointer"
+					className="relative flex-1 bg-[#101015] rounded-b-lg border-x border-b border-border/60 overflow-y-auto no-scrollbar flex flex-col p-1 gap-1"
 				>
-					{/* Playhead Line passing through all tracks */}
-					<div
-						style={{ left: `${(currentTime / totalDuration) * 100}%` }}
-						className="absolute top-0 bottom-0 w-0.5 bg-primary z-30 pointer-events-none"
-					/>
-
 					{tracks.map((track) => (
 						<div key={track.id} className="relative flex items-center h-8 rounded bg-[#171720] border border-border/50">
 							{/* Track Header Label */}
@@ -898,8 +1118,42 @@ export function CinematicTimelineEditor({
 								<span className="text-[8px] opacity-75">{track.type}</span>
 							</div>
 
-							{/* Clips in this track */}
-							<div className="relative flex-1 h-full overflow-hidden">
+							{/* Clips & Visual Compás Grid in this track */}
+							<div
+								onClick={handleTimelineClick}
+								className="relative flex-1 h-full overflow-hidden cursor-pointer"
+							>
+								{/* Vertical Compás Gridlines */}
+								{showBeatGrid &&
+									beatAnalysis?.barTimes.map((barT, idx) => {
+										const leftPercent = (barT / totalDuration) * 100;
+										if (leftPercent > 100) return null;
+										return (
+											<div
+												key={`tbar-${idx}`}
+												style={{ left: `${leftPercent}%` }}
+												className="pointer-events-none absolute top-0 bottom-0 border-l border-amber-400/25 z-[1]"
+											/>
+										);
+									})}
+
+								{/* Vocal Entry Guide */}
+								{showBeatGrid &&
+									beatAnalysis &&
+									beatAnalysis.vocalEntryTime > 0.3 &&
+									beatAnalysis.vocalEntryTime < totalDuration && (
+										<div
+											style={{ left: `${(beatAnalysis.vocalEntryTime / totalDuration) * 100}%` }}
+											className="pointer-events-none absolute top-0 bottom-0 border-l border-dashed border-emerald-400/50 z-[1]"
+										/>
+									)}
+
+								{/* Playhead Line inside clips lane */}
+								<div
+									style={{ left: `${(currentTime / totalDuration) * 100}%` }}
+									className="absolute top-0 bottom-0 w-0.5 bg-primary z-30 pointer-events-none"
+								/>
+
 								{track.clips.map((clip) => {
 									const leftPercent = (clip.startTime / totalDuration) * 100;
 									const widthPercent = (clip.duration / totalDuration) * 100;
@@ -912,7 +1166,7 @@ export function CinematicTimelineEditor({
 												e.stopPropagation();
 												setSelectedClipId(clip.id);
 											}}
-											className={`absolute top-0.5 bottom-0.5 rounded px-2 flex items-center justify-between text-[10px] font-semibold text-white shadow-sm overflow-hidden border border-white/10 ${
+											className={`absolute top-0.5 bottom-0.5 z-[2] rounded px-2 flex items-center justify-between text-[10px] font-semibold text-white shadow-sm overflow-hidden border border-white/10 ${
 												track.type === 'video'
 													? 'bg-gradient-to-r from-blue-700 to-cyan-600'
 													: 'bg-gradient-to-r from-emerald-700 to-teal-600'
@@ -920,7 +1174,7 @@ export function CinematicTimelineEditor({
 										>
 											<span className="truncate">{clip.title}</span>
 											<span className="text-[8px] font-mono opacity-80 flex-none ml-1">
-												{Math.round(clip.duration)}s
+												{clip.duration.toFixed(1)}s
 											</span>
 										</div>
 									);

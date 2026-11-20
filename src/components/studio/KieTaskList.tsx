@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { Check, Copy, Download, ExternalLink, Loader2, Trash2 } from 'lucide-react';
 import { useI18n } from '@/hooks/useI18n';
 import { copyText, deleteKieTask, wordsToLrc, type KieTask } from '@/lib/kie';
+import { sanitizeExternalUrl } from '@/lib/safeUrl';
 
 const LABELS: Record<string, string> = {
   wav: 'Studio WAV',
@@ -28,21 +29,26 @@ function Result({ task }: {task: KieTask;}) {
   const { t } = useI18n();
   const r = task.result ?? {};
   if (task.service === 'wav' && typeof r.url === 'string') {
-    return <a data-ev-id="ev_kt_wav" href={r.url} target="_blank" rel="noreferrer" download className={linkBtn}><Download className="h-3.5 w-3.5" /> {t('Download WAV')}</a>;
+    const safeUrl = sanitizeExternalUrl(r.url);
+    if (!safeUrl) return null;
+    return <a data-ev-id="ev_kt_wav" href={safeUrl} target="_blank" rel="noopener noreferrer" download className={linkBtn}><Download className="h-3.5 w-3.5" /> {t('Download WAV')}</a>;
   }
   if (task.service === 'video' && typeof r.url === 'string') {
+    const safeUrl = sanitizeExternalUrl(r.url);
+    if (!safeUrl) return null;
     return (
       <div data-ev-id="ev_kt_video" className="flex flex-col gap-2">
-        <video data-ev-id="ev_kt_video_el" src={r.url} controls preload="metadata" className="aspect-video w-full rounded-lg bg-black" />
-        <a data-ev-id="ev_kt_video_dl" href={r.url} target="_blank" rel="noreferrer" download className={`${linkBtn} self-start`}><Download className="h-3.5 w-3.5" /> {t('Download MP4')}</a>
+        <video data-ev-id="ev_kt_video_el" src={safeUrl} controls preload="metadata" className="aspect-video w-full rounded-lg bg-black" />
+        <a data-ev-id="ev_kt_video_dl" href={safeUrl} target="_blank" rel="noopener noreferrer" download className={`${linkBtn} self-start`}><Download className="h-3.5 w-3.5" /> {t('Download MP4')}</a>
       </div>);
 
   }
   if (task.service === 'cover_image' && Array.isArray(r.images)) {
+    const safeImages = (r.images as string[]).map(sanitizeExternalUrl).filter((u): u is string => Boolean(u));
     return (
       <div data-ev-id="ev_kt_imgs" className="grid grid-cols-2 gap-2">
-        {(r.images as string[]).map((src) =>
-        <a data-ev-id="ev_kt_img" key={src} href={src} target="_blank" rel="noreferrer" className="group relative overflow-hidden rounded-lg">
+        {safeImages.map((src) =>
+        <a data-ev-id="ev_kt_img" key={src} href={src} target="_blank" rel="noopener noreferrer" className="group relative overflow-hidden rounded-lg">
             <img data-ev-id="ev_kt_img_el" src={src} alt={t('AI cover art')} loading="lazy" className="aspect-square w-full object-cover transition-transform group-hover:scale-105" />
             <ExternalLink className="absolute right-2 top-2 h-4 w-4 text-white opacity-0 drop-shadow group-hover:opacity-100" />
           </a>

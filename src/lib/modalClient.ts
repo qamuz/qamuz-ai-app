@@ -1,4 +1,5 @@
 import { supabase } from '@/integrations/supabase/client';
+import { getAuthHeaders } from '@/lib/safeUrl';
 import type { Creation } from '@/lib/studio';
 
 export interface ModalHealth {
@@ -7,8 +8,6 @@ export interface ModalHealth {
 	visionAuthOk?: boolean;
 	vllmConfigured: boolean;
 	geminiConfigured: boolean;
-	visionUrl: string;
-	vllmUrl: string;
 	remoteVisionOk: boolean;
 	models: string[];
 }
@@ -55,8 +54,6 @@ export async function checkModalHealth(force = false): Promise<ModalHealth> {
 		visionConfigured: false,
 		vllmConfigured: false,
 		geminiConfigured: false,
-		visionUrl: '',
-		vllmUrl: '',
 		remoteVisionOk: false,
 		models: [],
 	};
@@ -96,16 +93,76 @@ function dataUriToBlob(dataUri: string): { blob: Blob; mime: string; ext: string
 	return { blob: new Blob([bytes], { type: mime }), mime, ext };
 }
 
+async function prepareReferenceImageDataUri(rawUrl: string): Promise<string> {
+	const cleaned = (rawUrl || '').trim();
+	if (!cleaned) return '';
+	// Keep normal HTTPS URLs untouched so the server fetches them directly without bloating browser upload,
+	// ONLY convert local blob: URLs or oversized data:image/ URIs (> 2.5MB) to a clean 1280px JPEG data URI.
+	const needsCanvasConversion =
+		cleaned.startsWith('blob:') ||
+		(cleaned.startsWith('data:image/') && cleaned.length > 2_500_000);
+	if (!needsCanvasConversion) return cleaned;
+
+	try {
+		const img = await new Promise<HTMLImageElement>((resolve, reject) => {
+			const el = new Image();
+			el.onload = () => resolve(el);
+			el.onerror = () => reject(new Error('No se pudo leer la imagen inicial'));
+			el.src = cleaned;
+		});
+		const maxSide = 1280;
+		const scale = Math.min(1, maxSide / Math.max(1, img.naturalWidth, img.naturalHeight));
+		const w = Math.max(64, Math.round(img.naturalWidth * scale));
+		const h = Math.max(64, Math.round(img.naturalHeight * scale));
+		const canvas = document.createElement('canvas');
+		canvas.width = w;
+		canvas.height = h;
+		const ctx = canvas.getContext('2d');
+		if (!ctx) return cleaned;
+		ctx.drawImage(img, 0, 0, w, h);
+		return canvas.toDataURL('image/jpeg', 0.9);
+	} catch {
+		return cleaned.startsWith('blob:') ? '' : cleaned;
+	}
+}
+
 export async function createLocalModalCreation(
 	kind: 'image' | 'video',
 	prompt: string,
 	options: Record<string, unknown>
 ): Promise<{ data?: { id: string }; error?: string }> {
 	const endpoint = kind === 'image' ? '/api/modal/image' : '/api/modal/video';
+	const requestOptions: Record<string, unknown> = { ...options };
+
+	if (kind === 'video') {
+		const candidateRef = String(
+			requestOptions.image ||
+				requestOptions.image_b64 ||
+				requestOptions.reference_image_url ||
+				requestOptions.image_url ||
+				''
+		).trim();
+		if (candidateRef) {
+			const prepared = await prepareReferenceImageDataUri(candidateRef);
+			if (prepared) {
+				if (prepared.startsWith('data:image/')) {
+					requestOptions.image = prepared;
+					delete requestOptions.reference_image_url;
+				} else {
+					requestOptions.reference_image_url = prepared;
+				}
+			} else if (candidateRef.startsWith('blob:')) {
+				delete requestOptions.reference_image_url;
+				delete requestOptions.image;
+			}
+		}
+	}
+
+	const headers = await getAuthHeaders({ 'Content-Type': 'application/json' });
 	const res = await fetch(endpoint, {
 		method: 'POST',
-		headers: { 'Content-Type': 'application/json' },
-		body: JSON.stringify({ prompt, ...options }),
+		headers,
+		body: JSON.stringify({ prompt, ...requestOptions }),
 	});
 	const payload = (await res.json().catch(() => ({}))) as {
 		call_id?: string;
@@ -117,14 +174,25 @@ export async function createLocalModalCreation(
 
 	const id = `local-modal-${crypto.randomUUID()}`;
 	const src = options.source as { title?: string; cover_url?: string } | undefined;
-	const refImg = typeof options.reference_image_url === 'string' ? options.reference_image_url : null;
+	const refImg = typeof options.reference_image_url === 'string' && !options.reference_image_url.startsWith('data:')
+		? options.reference_image_url
+		: null;
+
+	// Strip heavy base64 image buffers from persisted metadata options
+	const safeStoredOptions: Record<string, unknown> = { ...options };
+	if (typeof safeStoredOptions.image === 'string' && safeStoredOptions.image.startsWith('data:')) {
+		delete safeStoredOptions.image;
+	}
+	if (typeof safeStoredOptions.image_b64 === 'string' && safeStoredOptions.image_b64.startsWith('data:')) {
+		delete safeStoredOptions.image_b64;
+	}
 
 	localJobs.set(id, {
 		id,
 		callId: payload.call_id,
 		kind,
 		prompt,
-		options,
+		options: safeStoredOptions,
 		status: 'generating',
 		title: src?.title ? String(src.title).slice(0, 120) : null,
 		result_urls: [],
@@ -144,7 +212,8 @@ export async function refreshLocalModalCreation(id: string): Promise<{ ok: boole
 	}
 
 	try {
-		const res = await fetch(`/api/modal/status/${encodeURIComponent(job.callId)}`);
+		const headers = await getAuthHeaders();
+		const res = await fetch(`/api/modal/status/${encodeURIComponent(job.callId)}`, { headers });
 		const data = (await res.json().catch(() => ({ status: 'PROCESSING' }))) as {
 			status?: string;
 			output?: unknown;
@@ -256,9 +325,10 @@ export async function writeLyricsWithModal(payload: {
 	mode?: string;
 	language?: string;
 }): Promise<{ lyrics?: string; title?: string; style?: string; error?: string }> {
+	const headers = await getAuthHeaders({ 'Content-Type': 'application/json' });
 	const res = await fetch('/api/modal/lyrics', {
 		method: 'POST',
-		headers: { 'Content-Type': 'application/json' },
+		headers,
 		body: JSON.stringify(payload),
 	});
 	const data = (await res.json().catch(() => ({}))) as {
@@ -281,7 +351,8 @@ export async function writeLyricsWithModal(payload: {
 
 	for (let i = 0; i < 120; i++) {
 		await new Promise((r) => window.setTimeout(r, 2500));
-		const pollRes = await fetch(`/api/modal/status/${encodeURIComponent(data.call_id)}`);
+		const pollHeaders = await getAuthHeaders();
+		const pollRes = await fetch(`/api/modal/status/${encodeURIComponent(data.call_id)}`, { headers: pollHeaders });
 		const pollData = (await pollRes.json().catch(() => ({ status: 'PROCESSING' }))) as {
 			status?: string;
 			output?: { lyrics?: string; title?: string; style?: string } | string;

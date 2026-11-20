@@ -10,6 +10,7 @@ import { isLocalModalId, removeLocalModalCreation } from '@/lib/modalClient';
 import { useModules } from '@/hooks/useModules';
 import { publishMusicVideo } from '@/lib/videos';
 import { formatTime } from '@/lib/format';
+import { sanitizeExternalUrl } from '@/lib/safeUrl';
 import type { TrackWithArtist } from '@/types/music';
 
 interface Props {
@@ -169,8 +170,10 @@ export function CreationRow({ creation, onChange, onDeleted, onOpen }: Props) {
         onClick={() => {
           if (creation.kind === 'music') playTracks(tracks, 0);else
           if (creation.kind === 'video' && onOpen) onOpen();else
-          if (creation.kind === 'video') setShowVideo((v) => !v);else
-          window.open(creation.result_urls[0], '_blank', 'noopener');
+          if (creation.kind === 'video') setShowVideo((v) => !v);else {
+            const safeUrl = sanitizeExternalUrl(creation.result_urls[0]);
+            if (safeUrl) window.open(safeUrl, '_blank', 'noopener,noreferrer');
+          }
         }}
         aria-label={creation.kind === 'music' ? firstPlaying ? t('Pause') : t('Play') : t('Open')}
         className="group relative flex h-12 w-12 flex-none items-center justify-center overflow-hidden rounded-lg bg-surface-2 text-muted-foreground">
@@ -228,8 +231,8 @@ export function CreationRow({ creation, onChange, onDeleted, onOpen }: Props) {
                   <Film className="h-3.5 w-3.5" /> <span data-ev-id="ev_7c9217e27f" className="hidden sm:inline">{t('Video gallery')}</span>
                 </button>
             }
-              {creation.kind !== 'music' && creation.result_urls[0] &&
-            <a data-ev-id="ev_cr_open" href={creation.result_urls[0]} target="_blank" rel="noreferrer" aria-label={t('Open')} className="flex h-9 w-9 items-center justify-center rounded-lg text-muted-foreground hover:bg-surface-2 hover:text-foreground">
+              {creation.kind !== 'music' && sanitizeExternalUrl(creation.result_urls[0]) &&
+            <a data-ev-id="ev_cr_open" href={sanitizeExternalUrl(creation.result_urls[0])!} target="_blank" rel="noopener noreferrer" aria-label={t('Open')} className="flex h-9 w-9 items-center justify-center rounded-lg text-muted-foreground hover:bg-surface-2 hover:text-foreground">
                   <ExternalLink className="h-4 w-4" />
                 </a>
             }

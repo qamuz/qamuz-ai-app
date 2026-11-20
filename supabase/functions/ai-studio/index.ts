@@ -106,7 +106,16 @@ async function markError(admin: SupabaseClient, table: string, id: string, messa
 
 async function refundCreation(admin: SupabaseClient, creation: Row, message: string) {
 	if (!(await markError(admin, 'ai_creations', creation.id, message))) return;
-	if (creation.credits_spent > 0) await addCredits(admin, creation.user_id, creation.credits_spent, 'Reembolso por error', creation.id);
+	if (creation.credits_spent <= 0) return;
+	const { data: debit } = await admin
+		.from('credit_transactions')
+		.select('amount')
+		.eq('user_id', creation.user_id)
+		.eq('creation_id', creation.id)
+		.lt('amount', 0)
+		.maybeSingle();
+	const verifiedRefund = debit ? Math.min(creation.credits_spent, Math.abs(Number(debit.amount))) : 0;
+	if (verifiedRefund > 0) await addCredits(admin, creation.user_id, verifiedRefund, 'Reembolso por error', creation.id);
 }
 
 async function failStem(admin: SupabaseClient, job: Row, message: string) {
@@ -416,15 +425,49 @@ async function modalStatus(token: string, callId: string): Promise<Record<string
 	return (await res.json().catch(() => ({ status: 'PROCESSING' }))) as Record<string, unknown>;
 }
 
-/** Download an image and return it as a data URI (empty string if it can't be fetched or is too big). */
-async function toDataUri(url: string): Promise<string> {
+function isSafePublicHttpsUrl(raw: string): boolean {
 	try {
-		const res = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0 (QamuzAI)', Accept: 'image/*' }, signal: AbortSignal.timeout(30000) });
+		const parsed = new URL(raw);
+		if (parsed.protocol !== 'https:') return false;
+		if (parsed.username || parsed.password) return false;
+		const host = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, '');
+		if (
+			!host ||
+			host === 'localhost' ||
+			host.endsWith('.local') ||
+			host.endsWith('.internal') ||
+			host === 'metadata.google.internal' ||
+			/^\d+\.\d+\.\d+\.\d+$/.test(host) ||
+			host.includes(':')
+		) {
+			return false;
+		}
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+/** Download a validated public HTTPS image (or accept an existing safe data URI) and return it as a data URI. */
+async function toDataUri(url: string): Promise<string> {
+	const raw = (url || '').trim();
+	if (!raw) return '';
+	if (raw.startsWith('data:image/') && !raw.startsWith('data:image/svg')) {
+		return raw.length <= 14_000_000 ? raw : '';
+	}
+	if (!isSafePublicHttpsUrl(raw)) return '';
+	try {
+		const res = await fetch(raw, {
+			headers: { 'User-Agent': 'Mozilla/5.0 (QamuzAI)', Accept: 'image/*,*/*;q=0.8' },
+			redirect: 'follow',
+			signal: AbortSignal.timeout(30000),
+		});
 		if (!res.ok) return '';
-		const type = res.headers.get('content-type')?.split(';')[0] || 'image/jpeg';
-		if (!type.startsWith('image/')) return '';
+		if (res.url && !isSafePublicHttpsUrl(res.url)) return '';
+		const type = res.headers.get('content-type')?.split(';')[0]?.trim().toLowerCase() || 'image/jpeg';
+		if (!type.startsWith('image/') || type === 'image/svg+xml') return '';
 		const bytes = new Uint8Array(await res.arrayBuffer());
-		if (bytes.length === 0 || bytes.length > 8_000_000) return '';
+		if (bytes.length === 0 || bytes.length > 12_000_000) return '';
 		let bin = '';
 		for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
 		return `data:${type};base64,${btoa(bin)}`;
@@ -575,11 +618,27 @@ async function startMusic(admin: SupabaseClient, creation: Creation, provider: P
 }
 
 
-async function startVideo(admin: SupabaseClient, creation: Creation, provider: Provider, apiKey: string, prompt: string, aspectRatio: string) {
+async function startVideo(
+	admin: SupabaseClient,
+	creation: Creation,
+	provider: Provider,
+	apiKey: string,
+	prompt: string,
+	aspectRatio: string,
+	refImageUrl?: string | null
+) {
+	const reqBody: Record<string, unknown> = {
+		prompt: prompt.slice(0, 1000),
+		model: provider.model || 'veo3_fast',
+		aspectRatio,
+	};
+	if (refImageUrl && /^https:\/\//.test(refImageUrl)) {
+		reqBody.imageUrls = [refImageUrl];
+	}
 	const res = await fetch('https://api.kie.ai/api/v1/veo/generate', {
 		method: 'POST',
 		headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
-		body: JSON.stringify({ prompt: prompt.slice(0, 1000), model: provider.model || 'veo3_fast', aspectRatio }),
+		body: JSON.stringify(reqBody),
 	});
 	const payload = await res.json().catch(() => ({}));
 	const taskId = payload?.data?.taskId as string | undefined;
@@ -860,7 +919,9 @@ Deno.serve(async (req) => {
 					model_id: provider.model || 'qamuz-image-flux',
 				});
 			} else if (provider.slug === 'modal-video') {
-				const style = options.style ? `, ${String(options.style)} style` : '';
+				const styleStr = options.style ? String(options.style).trim() : '';
+				const hasStyleAlready = styleStr && prompt.toLowerCase().includes(styleStr.toLowerCase());
+				const style = styleStr && !hasStyleAlready ? `, ${styleStr} style` : '';
 				const aspect = options.aspect === '9:16' || String(options.size) === '1024x1536' ? '9:16' : '16:9';
 				const src = (options.source ?? null) as Record<string, unknown> | null;
 				let cover: string | null = null;
@@ -869,18 +930,32 @@ Deno.serve(async (req) => {
 					const songTitle = typeof src.title === 'string' ? src.title.slice(0, 120) : null;
 					await admin.from('ai_creations').update({ thumbnail_url: cover, title: songTitle }).eq('id', creation.id);
 				}
-				const refImg = typeof options.reference_image_url === 'string' && /^https:\/\//.test(options.reference_image_url) ? options.reference_image_url : null;
-				if (!cover && refImg) {
+				const refImgRaw = typeof options.reference_image_url === 'string'
+					? options.reference_image_url.trim()
+					: typeof options.image === 'string'
+					? options.image.trim()
+					: '';
+				const refImg = (/^https:\/\//.test(refImgRaw) || refImgRaw.startsWith('data:image/')) ? refImgRaw : null;
+				if (!cover && refImg && /^https:\/\//.test(refImg)) {
 					await admin.from('ai_creations').update({ thumbnail_url: refImg }).eq('id', creation.id);
 				}
-				// Animates the chosen start image or song cover; otherwise Modal makes the first frame from the prompt.
-				const startImgUrl = refImg || cover;
+				// Animate only an explicitly chosen start frame (never distort a square album cover with text);
+				// when no start frame is provided, Modal FLUX generates a clean photorealistic 16:9/9:16 first frame.
+				const startImgUrl = refImg || (options.use_cover_as_frame ? cover : null);
 				const image = startImgUrl ? await toDataUri(startImgUrl) : '';
+				const rawMotion = Number(options.motion);
+				const calibratedMotion = Number.isFinite(rawMotion) ? Math.max(25, Math.min(105, Math.round(rawMotion))) : 62;
+				const rawNoise = Number(options.noise_aug_strength);
+				const calibratedNoise = Number.isFinite(rawNoise) ? Math.max(0.005, Math.min(0.05, rawNoise)) : 0.015;
 				await startModal(admin, creation, apiKey, 'video', {
 					prompt: `${prompt}${style}`.slice(0, 1000),
 					image,
 					aspect_ratio: aspect,
 					model_id: provider.model || 'qamuz-video-svd',
+					fps: 12,
+					motion: calibratedMotion,
+					num_frames: 25,
+					noise_aug_strength: calibratedNoise,
 				});
 			} else if (provider.slug === 'kie-suno') {
 				const instrumental = Boolean(options.instrumental);
@@ -926,7 +1001,7 @@ Deno.serve(async (req) => {
 				} else if (refImg) {
 					await admin.from('ai_creations').update({ thumbnail_url: refImg }).eq('id', creation.id);
 				}
-				await startVideo(admin, creation, provider, apiKey, `${prompt}${style}`, aspect);
+				await startVideo(admin, creation, provider, apiKey, `${prompt}${style}`, aspect, refImg);
 			}
 			return json({ id: creation.id });
 		}

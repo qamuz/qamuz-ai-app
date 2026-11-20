@@ -27,10 +27,11 @@ import {
 	MV_LIP_SYNC_MODES,
 	MV_STYLES,
 	buildMusicVideoPrompt,
+	deriveRecommendedMotion,
 } from '@/lib/music-video/presets';
 import { COLOR_GRADE_PRESETS } from '@/lib/storyboard';
 import type { Creation, ProviderInfo, StudioSong } from '@/lib/studio';
-import { magicEnhancePrompt } from '@/lib/nle/maestroDirector';
+import { magicEnhancePromptDetailed } from '@/lib/nle/maestroDirector';
 import {
 	NLE_TRANSITIONS,
 	type NleAspectRatio,
@@ -164,6 +165,7 @@ export function MediaBinPanel({
 	const [aiDirector, setAiDirector] = useState<string>(AUTEUR_DIRECTORS[1].name);
 	const [aiStartImg, setAiStartImg] = useState<string | null>(null);
 	const [aiPromptExtra, setAiPromptExtra] = useState('');
+	const [aiRecommendedMotion, setAiRecommendedMotion] = useState<number | null>(null);
 	const [wandLoading, setWandLoading] = useState(false);
 	const [submittingAi, setSubmittingAi] = useState(false);
 	const [aiMsg, setAiMsg] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
@@ -297,6 +299,7 @@ export function MediaBinPanel({
 
 		setSubmittingAi(true);
 		setAiMsg(null);
+		const calibratedMotion = aiRecommendedMotion ?? deriveRecommendedMotion(aiMotion);
 		try {
 			await onGenerateAiVideo(compiled, {
 				style: aiStyle,
@@ -306,6 +309,10 @@ export function MediaBinPanel({
 				character: aiChar,
 				background: aiBg,
 				cameraMotion: aiMotion,
+				motion: calibratedMotion,
+				noise_aug_strength: 0.015,
+				fps: 12,
+				num_frames: 25,
 				lipSync: aiLipSync,
 				lipSyncMode: aiLipMode,
 				filmGenre: aiGenre,
@@ -756,16 +763,42 @@ export function MediaBinPanel({
 									setWandLoading(true);
 									setAiMsg(null);
 									try {
-										const enhanced = await magicEnhancePrompt(
+										const previousVideos = creations
+											.filter(
+												(c) =>
+													c.kind === 'video' &&
+													(c.status === 'ready' || c.status === 'generating')
+											)
+											.slice(0, 6)
+											.map((c) => `${c.title ? `${c.title}: ` : ''}${c.prompt}`.slice(0, 200))
+											.filter(Boolean);
+
+										const enhanced = await magicEnhancePromptDetailed(
 											aiPromptExtra || `${aiStyle} en ${aiBg}`,
 											{
+												mode: 'video-prompt',
 												style: aiStyle,
 												character: aiChar,
 												format: aiCategory === 'cinema' ? 'short-film' : 'music-video',
 												songTitle: selectedSongObj?.title,
+												cameraMotion: aiMotion,
+												hasStartImage: Boolean(aiStartImg),
+												previousVideos,
+												sceneContext: `Background: ${aiBg}. Camera motion: ${aiMotion}.`,
 											}
 										);
-										setAiPromptExtra(enhanced.slice(0, 400));
+										setAiPromptExtra(enhanced.prompt.slice(0, 400));
+										if (typeof enhanced.recommendedMotion === 'number') {
+											setAiRecommendedMotion(enhanced.recommendedMotion);
+										}
+										if (enhanced.continuityNote || previousVideos.length > 0) {
+											setAiMsg({
+												type: 'ok',
+												text:
+													enhanced.continuityNote ||
+													`Continuidad sincronizada con ${previousVideos.length} video(s) creado(s).`,
+											});
+										}
 									} catch (err) {
 										setAiMsg({
 											type: 'err',

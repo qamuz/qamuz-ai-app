@@ -16,8 +16,13 @@ The token lives in the Modal secret "qamuz-service" (key QAMUZ_SERVICE_TOKEN).
 
 import base64
 import io
+import ipaddress
 import os
+import re
 import secrets as pysecrets
+import socket
+import tempfile
+import urllib.parse
 from typing import Optional
 
 import modal
@@ -110,9 +115,19 @@ lyrics_image = (
 web_image = modal.Image.debian_slim(python_version="3.11").pip_install("fastapi[standard]")
 
 
+ALLOWED_MODELS = set(ALIASES.values()) | {DEFAULT_IMAGE_MODEL, DEFAULT_VIDEO_MODEL}
+MAX_REMOTE_IMAGE_BYTES = 15 * 1024 * 1024
+SAFE_CALL_ID_RE = re.compile(r"^[a-zA-Z0-9._-]{4,128}$")
+
+
 def resolve_model(model_id: Optional[str], default: str) -> str:
     model_id = (model_id or "").strip()
-    return ALIASES.get(model_id, model_id) or default
+    if not model_id:
+        return default
+    resolved = ALIASES.get(model_id, model_id)
+    if resolved not in ALLOWED_MODELS:
+        raise ValueError(f"Model not allowed: {model_id}")
+    return resolved
 
 
 def pick_seed(seed) -> int:
@@ -123,18 +138,60 @@ def pick_seed(seed) -> int:
     return seed if seed >= 0 else pysecrets.randbelow(2**31 - 1)
 
 
+def _validate_public_image_url(url: str) -> str:
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ("https", "http"):
+        raise ValueError("Unsupported image URL scheme")
+    if parsed.username or parsed.password:
+        raise ValueError("URL credentials are not allowed")
+    host = (parsed.hostname or "").strip().lower()
+    if (
+        not host
+        or host == "localhost"
+        or host.endswith(".local")
+        or host.endswith(".internal")
+        or host == "metadata.google.internal"
+    ):
+        raise ValueError("Internal image host is not allowed")
+    infos = socket.getaddrinfo(host, None)
+    if not infos:
+        raise ValueError("Could not resolve image host")
+    for info in infos:
+        ip_obj = ipaddress.ip_address(info[4][0])
+        if (
+            ip_obj.is_private
+            or ip_obj.is_loopback
+            or ip_obj.is_link_local
+            or ip_obj.is_multicast
+            or ip_obj.is_reserved
+            or ip_obj.is_unspecified
+        ):
+            raise ValueError("Private or reserved IP address is not allowed")
+    return url
+
+
 def load_image_bytes(image: str) -> bytes:
-    """Accept a data URI, raw base64 or an http(s) URL."""
+    """Accept a data URI, raw base64 or a validated public http(s) URL."""
     image = (image or "").strip()
     if image.startswith("http://") or image.startswith("https://"):
         import urllib.request
 
-        req = urllib.request.Request(image, headers={"User-Agent": "qamuz-vision/1.0"})
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            return resp.read()
+        safe_url = _validate_public_image_url(image)
+        req = urllib.request.Request(safe_url, headers={"User-Agent": "qamuz-vision/1.0"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            final_url = resp.geturl()
+            if final_url and final_url != safe_url:
+                _validate_public_image_url(final_url)
+            raw = resp.read(MAX_REMOTE_IMAGE_BYTES + 1)
+            if len(raw) > MAX_REMOTE_IMAGE_BYTES:
+                raise ValueError("Image exceeds maximum allowed size (15 MB)")
+            return raw
     if "," in image and image.startswith("data:"):
         image = image.split(",", 1)[1]
-    return base64.b64decode(image)
+    raw = base64.b64decode(image)
+    if len(raw) > MAX_REMOTE_IMAGE_BYTES:
+        raise ValueError("Decoded image exceeds maximum allowed size (15 MB)")
+    return raw
 
 
 @app.cls(
@@ -242,29 +299,96 @@ class QamuzVisionEngine:
             self._clear_vram()
             raise Exception("GPU out of memory. The model might be too large or the resolution too high.")
 
-    def _video(self, image, width, height, fps=12, model_id=DEFAULT_VIDEO_MODEL, seed=-1, motion=127, num_frames=25):
+    def _video(
+        self,
+        image,
+        width,
+        height,
+        fps=12,
+        model_id=DEFAULT_VIDEO_MODEL,
+        seed=-1,
+        motion=62,
+        num_frames=25,
+        noise_aug_strength=0.015,
+    ):
+        import subprocess
         import torch
+        from PIL import Image, ImageOps
         from diffusers.utils import export_to_video
 
         model_id = resolve_model(model_id, DEFAULT_VIDEO_MODEL)
         pipe = self._load_model(model_id, is_video=True)
-        image = image.convert("RGB").resize((int(width), int(height)))
+        # Aspect-ratio preserving center crop (prevents stretching faces/bodies)
+        image = ImageOps.fit(
+            image.convert("RGB"),
+            (int(width), int(height)),
+            method=Image.Resampling.LANCZOS,
+        )
 
-        frames = pipe(
-            image,
-            width=int(width),
-            height=int(height),
-            num_frames=int(num_frames),
-            decode_chunk_size=8,
-            motion_bucket_id=int(motion),
-            fps=int(fps),
-            generator=torch.manual_seed(pick_seed(seed)),
-        ).frames[0]
+        # Calibrate SVD-XT conditioning for realistic, non-jumping live-action motion:
+        # SVD-XT is natively conditioned around fps=6..8 and motion_bucket_id=45..85.
+        safe_motion = max(20, min(115, int(motion)))
+        safe_noise = max(0.005, min(0.06, float(noise_aug_strength)))
+        svd_cond_fps = 7
+        export_fps = max(8, min(24, int(fps)))
+        generator = torch.Generator(device="cpu").manual_seed(pick_seed(seed))
 
-        out_path = "/tmp/out.mp4"
-        export_to_video(frames, out_path, fps=int(fps))
-        with open(out_path, "rb") as f:
-            return f.read()
+        try:
+            frames = pipe(
+                image,
+                width=int(width),
+                height=int(height),
+                num_frames=int(num_frames),
+                decode_chunk_size=4,
+                motion_bucket_id=safe_motion,
+                fps=svd_cond_fps,
+                noise_aug_strength=safe_noise,
+                num_inference_steps=25,
+                generator=generator,
+            ).frames[0]
+        except torch.cuda.OutOfMemoryError:
+            self._clear_vram()
+            raise Exception("GPU out of memory while rendering video. Try a smaller resolution or fewer frames.")
+
+        raw_tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
+        raw_path = raw_tmp.name
+        raw_tmp.close()
+        smooth_tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
+        smooth_path = smooth_tmp.name
+        smooth_tmp.close()
+        try:
+            export_to_video(frames, raw_path, fps=export_fps)
+            # Re-encode with smooth temporal frame blending to 24fps H.264 yuv420p +faststart
+            # so every browser plays seamlessly without stuttering or frame jumps.
+            ffmpeg_cmd = [
+                "ffmpeg",
+                "-y",
+                "-i",
+                raw_path,
+                "-vf",
+                "minterpolate=fps=24:mi_mode=blend",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "fast",
+                "-crf",
+                "19",
+                "-pix_fmt",
+                "yuv420p",
+                "-movflags",
+                "+faststart",
+                smooth_path,
+            ]
+            proc = subprocess.run(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+            final_path = smooth_path if proc.returncode == 0 and os.path.getsize(smooth_path) > 1024 else raw_path
+            with open(final_path, "rb") as f:
+                return f.read()
+        finally:
+            for p in (raw_path, smooth_path):
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
 
     # ---------------- methods (callable from the web API or Python) ----------------
 
@@ -296,11 +420,12 @@ class QamuzVisionEngine:
         width: int = 1024,
         height: int = 576,
         seed: int = -1,
-        motion: int = 127,
+        motion: int = 62,
         image_model_id: str = DEFAULT_IMAGE_MODEL,
         num_frames: int = 25,
+        noise_aug_strength: float = 0.015,
     ) -> str:
-        """Image-to-video with 25 fluid frames at 12 fps. Returns an MP4 data URI."""
+        """Image-to-video with smooth 24fps interpolated H.264 output. Returns an MP4 data URI."""
         from PIL import Image
 
         if image_b64:
@@ -310,7 +435,17 @@ class QamuzVisionEngine:
         else:
             raise ValueError("Send an image or a prompt for the video.")
 
-        video = self._video(start, width, height, fps, model_id, seed, motion, num_frames)
+        video = self._video(
+            start,
+            width,
+            height,
+            fps,
+            model_id,
+            seed,
+            motion,
+            num_frames,
+            noise_aug_strength,
+        )
         return "data:video/mp4;base64," + base64.b64encode(video).decode("utf-8")
 
 
@@ -423,15 +558,15 @@ def api():
         if inp.get("width") and inp.get("height"):
             width, height = int(inp["width"]), int(inp["height"])
         width, height = max(256, min(2048, width)), max(256, min(2048, height))
-        steps = int(inp["steps"]) if inp.get("steps") else None
-        guidance = float(inp["guidance"]) if inp.get("guidance") else None
+        steps = max(1, min(50, int(inp["steps"]))) if inp.get("steps") else None
+        guidance = max(0.0, min(20.0, float(inp["guidance"]))) if inp.get("guidance") else None
         return dict(
-            prompt=str(inp.get("prompt") or "").strip(),
+            prompt=str(inp.get("prompt") or "").strip()[:1500],
             width=width,
             height=height,
             model_id=resolve_model(inp.get("model_id"), DEFAULT_IMAGE_MODEL),
             seed=inp.get("seed", -1),
-            negative_prompt=str(inp.get("negative_prompt") or ""),
+            negative_prompt=str(inp.get("negative_prompt") or "")[:600],
             steps=steps,
             guidance=guidance,
         )
@@ -439,17 +574,22 @@ def api():
     def video_args(inp: dict) -> dict:
         aspect = str(inp.get("aspect_ratio") or RATIO_TO_ASPECT.get(str(inp.get("ratio") or ""), "16:9"))
         width, height = VIDEO_SIZES.get(aspect, VIDEO_SIZES["16:9"])
+        raw_motion = inp.get("motion")
+        motion = max(20, min(115, int(raw_motion))) if raw_motion is not None else 62
+        raw_noise = inp.get("noise_aug_strength")
+        noise_aug = max(0.005, min(0.06, float(raw_noise))) if raw_noise is not None else 0.015
         return dict(
             image_b64=str(inp.get("image_b64") or inp.get("image") or inp.get("image_url") or ""),
-            fps=max(4, min(30, int(inp.get("fps") or 12))),
+            fps=max(6, min(24, int(inp.get("fps") or 12))),
             model_id=resolve_model(inp.get("model_id"), DEFAULT_VIDEO_MODEL),
             prompt=str(inp.get("prompt") or "").strip(),
             width=width,
             height=height,
             seed=inp.get("seed", -1),
-            motion=max(1, min(255, int(inp.get("motion") or 127))),
+            motion=motion,
             image_model_id=resolve_model(inp.get("image_model_id"), DEFAULT_IMAGE_MODEL),
             num_frames=max(14, min(25, int(inp.get("num_frames") or 25))),
+            noise_aug_strength=noise_aug,
         )
 
     @web.get("/health")
@@ -496,6 +636,8 @@ def api():
 
     @web.get("/status/{call_id}", dependencies=[Depends(check_auth)])
     async def status(call_id: str):
+        if not SAFE_CALL_ID_RE.match(call_id):
+            raise HTTPException(status_code=400, detail="Invalid call_id")
         function_timeout = getattr(modal.exception, "FunctionTimeoutError", None)
         try:
             call = modal.FunctionCall.from_id(call_id)

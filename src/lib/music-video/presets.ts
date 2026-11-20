@@ -209,85 +209,109 @@ export interface MusicVideoPromptInput {
 	scriptScene?: string;
 }
 
+const CAMERA_MOTION_TO_CINEMA: Record<string, string> = {
+	'Zoom in y barrido dinámico': 'slow stabilized dolly-in on a gimbal with gentle horizontal drift',
+	'Drone sweep panorámico': 'smooth continuous aerial crane glide moving steadily forward',
+	'Slow orbit alrededor del artista': 'steady slow 15-degree Steadicam arc around the subject keeping eyes in crisp focus',
+	'Handheld shake estilo cámara en mano': 'subtle grounded handheld documentary breathing with stabilized horizon',
+	'Fast tracking rítmico': 'fluid forward tracking shot on a Steadicam rig matching natural walking pace',
+	'Tomas cenitales y contrapicados': 'slow majestic low-angle pedestal rise revealing natural architectural depth',
+};
+
+const EXPRESSION_TO_CINEMA: Record<string, string> = {
+	'Pasional e Intenso (Clímax vocal y dramatismo)': 'deeply focused emotional expression, natural micro-expressions, genuine intensity',
+	'Sonriente y Enérgico (Vibra festiva y dance)': 'warm genuine smile, relaxed natural energy, charismatic presence',
+	'Desafiante y Urbano (Actitud Trap / Hip-Hop)': 'confident composed gaze, subtle head movement, grounded street charisma',
+	'Melancólico y Enigmático (Balada / R&B íntimo)': 'quiet introspective gaze, soft vulnerability, subtle natural blinking',
+	'Futurista y Sereno (Cyberpunk / Synthwave)': 'calm composed expression illuminated by soft ambient reflections',
+};
+
+const BACKGROUND_TO_CINEMA: Record<string, string> = {
+	'Office Neon': 'modern glass high-rise studio at dusk with soft warm tungsten practical lamps and distant city bokeh',
+	'Pink Garden': 'real twilight botanical courtyard with natural foliage, gentle breeze moving leaves, and golden-pink sunset sky',
+	'Cyber Grid': 'sleek rain-slicked nocturnal urban avenue with realistic wet asphalt reflections and soft architectural rim lights',
+	'Concert Stage': 'authentic live concert stage with subtle atmospheric haze, warm tungsten backlight, and realistic depth of field',
+	'Studio Lights': 'professional cinema soundstage with soft diffused key light, practical Edison bulbs, and natural filmic shadows',
+};
+
+/**
+ * Calibrates SVD motion_bucket_id (42..84) for realistic, rock-steady live-action motion
+ * without morphing, melting faces, or sudden frame jumps.
+ */
+export function deriveRecommendedMotion(cameraMotion?: string, framing?: 'close-up' | 'medium' | 'wide'): number {
+	const raw = String(cameraMotion || '').toLowerCase();
+	let base = 60;
+	if (/close|íntim|primer plano|slow|orbit|suave|lento|static|estátic/.test(raw)) {
+		base = 48;
+	} else if (/drone|aerial|tracking|travelling|fast|rápid|dinámic/.test(raw)) {
+		base = 74;
+	} else if (/handheld|mano/.test(raw)) {
+		base = 58;
+	}
+	if (framing === 'close-up') base = Math.min(base, 50);
+	if (framing === 'wide') base = Math.min(82, base + 8);
+	return Math.max(40, Math.min(84, base));
+}
+
 export function buildMusicVideoPrompt(input: MusicVideoPromptInput): string {
-	const lyrics = String(input.lyrics || '')
-		.replace(/\[[^\]]+\]/g, ' ')
-		.replace(/\s+/g, ' ')
-		.trim()
-		.slice(0, 160);
-	const vibes = input.vibeTags.filter(Boolean).slice(0, 4).join(', ');
-	const camera = input.cameraMotion || 'Zoom in y barrido dinámico';
+	const cleanExtra = String(input.extraPrompt || '').trim().slice(0, 320);
+	const cleanScript = String(input.scriptScene || '').trim().slice(0, 220);
+	const cameraCinema =
+		CAMERA_MOTION_TO_CINEMA[input.cameraMotion || ''] ||
+		(input.cameraMotion && !/[áéíóúñ]/i.test(input.cameraMotion)
+			? input.cameraMotion
+			: 'smooth stabilized Steadicam slow push-in');
 
 	const framingDesc =
 		input.actorFraming === 'close-up'
-			? 'Close-up facial & mouth shot'
+			? 'Intimate live-action close-up portrait framed on 85mm cinema prime lens, shallow depth of field'
 			: input.actorFraming === 'wide'
-			? 'Epic wide stage shot'
-			: 'Dynamic medium shot';
+			? 'Cinematic live-action wide establishing shot framed on 28mm anamorphic cinema lens, deep realistic environment'
+			: 'Cinematic live-action medium shot framed on 50mm cinema prime lens, natural depth of field';
 
-	const lipSyncDirective =
-		input.lipSync && (input.videoType === 'music-video' || input.videoType === 'short-film')
-			? `Lip-sync to vocals (${input.lipSyncMode || 'phoneme'})`
-			: '';
+	const expressionDesc =
+		EXPRESSION_TO_CINEMA[input.actorExpression || ''] ||
+		'authentic understated human expression';
 
-	const sfxDirective =
-		input.sfxEnabled && input.sfxPreset && input.sfxPreset !== 'sfx-none'
-			? `SFX: ${input.sfxPreset}`
-			: input.sfxAudioName
-			? `SFX track: ${input.sfxAudioName}`
-			: '';
+	const settingDesc =
+		BACKGROUND_TO_CINEMA[input.background || ''] ||
+		(input.background ? `realistic physical location: ${input.background}` : 'authentic real-world cinematic environment');
 
-	const actorDirective =
-		input.character && input.character !== 'Sin personaje (Atmósfera & Entorno)'
-			? `Artist: ${input.character}${input.actorConsistency ? ' (consistent likeness)' : ''}${input.actorExpression ? `, ${input.actorExpression}` : ''}`
-			: 'Focus on hyper-detailed environment & lighting';
+	const hasActor =
+		Boolean(input.character) && input.character !== 'Sin personaje (Atmósfera & Entorno)';
 
-	let productionHead = '';
-	if (input.videoType === 'short-film') {
-		productionHead = `Short film scene "${input.title.slice(0, 50)}"${input.filmGenre ? ` (${input.filmGenre})` : ''}, anamorphic cinema lens`;
-	} else if (input.videoType === 'film-trailer') {
-		productionHead = `Movie trailer for "${input.title.slice(0, 50)}"${input.filmGenre ? ` (${input.filmGenre})` : ''}, high-stakes cuts`;
-	} else if (input.videoType === 'art-visualizer') {
-		productionHead = `Fine-art music visualizer for "${input.title.slice(0, 50)}"`;
-	} else if (input.videoType === 'lyrics-video') {
-		productionHead = `Kinetic typography lyrics video for "${input.title.slice(0, 50)}"`;
-	} else {
-		productionHead = `Official music video for "${input.title.slice(0, 50)}"`;
-	}
+	const actorDirective = hasActor
+		? `Real human performer (${input.character}) with natural skin texture, realistic hair and wardrobe fabric folds, ${expressionDesc}${
+				input.lipSync && (input.videoType === 'music-video' || input.videoType === 'short-film')
+					? ', natural subtle vocal singing articulation and relaxed shoulders'
+					: ', grounded natural posture and breathing'
+		  }`
+		: 'Pure atmospheric live-action environment with subtle natural motion in light, air, and reflections';
 
 	const auteurDirective =
-		input.auteurDirector && input.auteurDirector !== 'auteur-none' && !input.auteurDirector.startsWith('Estilo Director')
-			? `Style of ${input.auteurDirector}`
+		input.auteurDirector &&
+		input.auteurDirector !== 'auteur-none' &&
+		!input.auteurDirector.startsWith('Estilo Director')
+			? `cinematography inspired by ${input.auteurDirector}`
 			: '';
 
-	const ratioDirective = input.cinematicRatio === '21:9' ? '2.39:1 CinemaScope' : '';
+	const moodTags = input.vibeTags
+		.filter((v) => v && !/viral|30s|hard beat/i.test(v))
+		.slice(0, 3)
+		.join(', ');
 
 	const coreParts = [
-		productionHead,
-		ratioDirective,
-		auteurDirective,
+		'Single continuous unbroken live-action cinema take, shot on ARRI Alexa Mini LF 35mm film',
 		framingDesc,
-		lipSyncDirective,
+		cleanExtra || cleanScript || '',
+		cleanExtra && cleanScript ? cleanScript : '',
 		actorDirective,
-		input.scriptScene ? `Scene: ${input.scriptScene.slice(0, 180)}` : '',
-		input.is30sViralHook ? '30s viral hook clip, instant explosive opening' : '',
-		input.videoGenMode === 'storyboard'
-			? 'Multi-shot storyboard flow'
-			: input.videoGenMode === 'narrative-scene'
-			? 'Continuous narrative scene'
-			: '',
-		input.style ? `${input.style} aesthetic` : '',
-		`Camera: ${camera}`,
-		input.background ? `Setting: ${input.background}` : '',
-		vibes ? `Vibe: ${vibes}` : '',
-		sfxDirective,
-		input.extraPrompt?.trim() ? input.extraPrompt.trim().slice(0, 220) : '',
-		lyrics
-			? input.videoType === 'lyrics-video'
-				? `Lyrics: ${lyrics}`
-				: `Story from lyrics: ${lyrics}`
-			: '',
-		'photorealistic 8k cinematography, volumetric lighting, color graded, no watermark',
+		`Setting: ${settingDesc}`,
+		`Camera movement: ${cameraCinema}`,
+		input.style ? `${input.style} film color grade` : 'natural filmic color grade',
+		auteurDirective,
+		moodTags ? `Atmosphere: ${moodTags}` : '',
+		'motivated practical lighting, natural film grain, physically consistent motion, steady temporal continuity, no jump cuts, no flicker, no morphing, no text or watermarks',
 	].filter(Boolean);
 
 	const joined = coreParts.join('. ');

@@ -482,9 +482,41 @@ export function ClipInspector({
 													setWandLoading(true);
 													setAiError(null);
 													try {
-														const improved = await magicEnhancePrompt(clip.aiPrompt || clip.title, {
-															sceneContext: `Clip de ${clip.duration.toFixed(1)}s en timeline`,
-														});
+														const sortedVisual = [...v1Clips].sort(
+															(a, b) => a.startTime - b.startTime
+														);
+														const idx = sortedVisual.findIndex((c) => c.id === clip.id);
+														const prevClip = idx > 0 ? sortedVisual[idx - 1] : null;
+														const nextClip =
+															idx >= 0 && idx < sortedVisual.length - 1
+																? sortedVisual[idx + 1]
+																: null;
+														const previousVideos = sortedVisual
+															.filter((c) => c.id !== clip.id && Boolean(c.aiPrompt || c.title))
+															.slice(0, 6)
+															.map((c) =>
+																`${c.title}: ${c.aiPrompt || c.title}`.slice(0, 180)
+															);
+
+														const improved = await magicEnhancePrompt(
+															clip.aiPrompt || clip.title,
+															{
+																mode:
+																	clip.type === 'video'
+																		? 'video-prompt'
+																		: 'enhance-prompt',
+																cameraMotion: clip.cameraMotion,
+																hasStartImage: Boolean(clip.sourceUrl),
+																previousVideos,
+																previousScenePrompt: prevClip
+																	? prevClip.aiPrompt || prevClip.title
+																	: '',
+																nextScenePrompt: nextClip
+																	? nextClip.aiPrompt || nextClip.title
+																	: '',
+																sceneContext: `Clip #${idx + 1} (${clip.duration.toFixed(1)}s) en timeline.`,
+															}
+														);
 														onUpdateClip(clip.id, (c) => ({
 															...c,
 															aiPrompt: improved,

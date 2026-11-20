@@ -36,8 +36,33 @@ Deno.serve(async (req) => {
 	} catch {
 		return json({ error: 'Solicitud inválida' }, 400);
 	}
-	const origin = String(body.origin ?? '');
-	if (!/^https?:\/\/[^\s/]+$/.test(origin)) return json({ error: 'Origen inválido' }, 400);
+	const rawOrigin = String(body.origin ?? req.headers.get('Origin') ?? '').trim();
+	const headerOrigin = (req.headers.get('Origin') ?? '').trim();
+	const envAllowed = (Deno.env.get('ALLOWED_ORIGINS') ?? '')
+		.split(',')
+		.map((s) => s.trim())
+		.filter(Boolean);
+	let origin = '';
+	try {
+		const parsed = new URL(rawOrigin);
+		if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+			return json({ error: 'Origen inválido' }, 400);
+		}
+		const normalized = parsed.origin;
+		const isAllowedEnv = envAllowed.length > 0 && envAllowed.includes(normalized);
+		const matchesHeader = Boolean(headerOrigin && headerOrigin === normalized);
+		const isLocalDev = parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1';
+		const isTrustedDomain =
+			parsed.hostname === 'qamuz.com' ||
+			parsed.hostname.endsWith('.qamuz.com') ||
+			parsed.hostname.endsWith('.run.app');
+		if (!isAllowedEnv && !(matchesHeader && (isLocalDev || isTrustedDomain))) {
+			return json({ error: 'Origen no autorizado' }, 403);
+		}
+		origin = normalized;
+	} catch {
+		return json({ error: 'Origen inválido' }, 400);
+	}
 
 	const { data: sub } = await admin
 		.from('subscriptions')

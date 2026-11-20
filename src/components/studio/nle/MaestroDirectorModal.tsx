@@ -20,10 +20,11 @@ import { CHARACTERS } from '@/lib/characters';
 import { coverUrl } from '@/lib/covers';
 import { formatTime } from '@/lib/format';
 import { audioDuration, uploadMedia } from '@/lib/media';
-import { MV_STYLES } from '@/lib/music-video/presets';
+import { MV_STYLES, deriveRecommendedMotion } from '@/lib/music-video/presets';
 import {
 	buildMaestroDirectorPlan,
 	magicEnhancePrompt,
+	magicEnhancePromptDetailed,
 	magicExpandStoryIdea,
 	type MaestroFormat,
 	type MaestroPlan,
@@ -184,14 +185,55 @@ export function MaestroDirectorModal({
 		setEnhancingSceneId(sc.id);
 		setGlobalError(null);
 		try {
-			const improved = await magicEnhancePrompt(sc.visualPrompt, {
-				style: plan.style,
-				character: plan.character,
-				format: plan.format,
-				songTitle: plan.title,
-				sceneContext: `${sc.sectionTag} (${formatTime(sc.startTime)}-${formatTime(sc.endTime)}). Acción: ${sc.narrativeAction}. Frase: ${sc.spokenCue}`,
-			});
-			updateScene(sc.id, (s) => ({ ...s, visualPrompt: improved }));
+			const sceneIdx = plan.scenes.findIndex((s) => s.id === sc.id);
+			const prevScene = sceneIdx > 0 ? plan.scenes[sceneIdx - 1] : null;
+			const nextScene =
+				sceneIdx >= 0 && sceneIdx < plan.scenes.length - 1
+					? plan.scenes[sceneIdx + 1]
+					: null;
+			const previousVideos = plan.scenes
+				.filter((s) => s.id !== sc.id && (Boolean(s.videoUrl) || s.sceneNumber < sc.sceneNumber))
+				.slice(-5)
+				.map((s) => `Scene #${s.sceneNumber} (${s.title}): ${s.visualPrompt}`.slice(0, 190));
+
+			const sceneContext = `${sc.sectionTag} (${formatTime(sc.startTime)}-${formatTime(sc.endTime)}). Shot: ${sc.shotType}. Action: ${sc.narrativeAction}. Spoken cue: ${sc.spokenCue}`;
+
+			const [improvedVisual, improvedMotion] = await Promise.all([
+				magicEnhancePrompt(sc.visualPrompt, {
+					mode: 'enhance-prompt',
+					style: plan.style,
+					character: plan.character,
+					format: plan.format,
+					songTitle: plan.title,
+					visualBible: plan.visualBible,
+					previousVideos,
+					previousScenePrompt: prevScene?.visualPrompt || '',
+					nextScenePrompt: nextScene?.visualPrompt || '',
+					cameraMotion: sc.cameraMotion,
+					sceneContext,
+				}),
+				magicEnhancePromptDetailed(sc.videoMotionPrompt || sc.visualPrompt, {
+					mode: 'video-prompt',
+					style: plan.style,
+					character: plan.character,
+					format: plan.format,
+					songTitle: plan.title,
+					visualBible: plan.visualBible,
+					previousVideos,
+					previousScenePrompt: prevScene?.videoMotionPrompt || prevScene?.visualPrompt || '',
+					nextScenePrompt: nextScene?.visualPrompt || '',
+					cameraMotion: sc.cameraMotion,
+					hasStartImage: true,
+					sceneContext,
+				}),
+			]);
+
+			updateScene(sc.id, (s) => ({
+				...s,
+				visualPrompt: improvedVisual,
+				videoMotionPrompt: improvedMotion.prompt,
+				errorMessage: undefined,
+			}));
 		} catch (err) {
 			updateScene(sc.id, (s) => ({
 				...s,
@@ -252,10 +294,10 @@ export function MaestroDirectorModal({
 		updateScene(scene.id, (s) => ({ ...s, status: 'generating_image', errorMessage: undefined }));
 		const size = aspect === '9:16' ? '1024x1536' : '1536x1024';
 
-		// Put shot composition & unique scene framing right at token 1 so FLUX/DALL-E creates distinct frames
+		// Put shot composition & unique scene framing right at token 1 so FLUX creates realistic, consistent frames
 		const distinctPrompt = `${scene.shotType || `Scene ${scene.sceneNumber}`}: ${scene.visualPrompt}${
-			ctxPlan?.visualBible ? `. Continuity Bible: ${ctxPlan.visualBible}` : ''
-		}`
+			ctxPlan?.visualBible ? `. Visual continuity: ${ctxPlan.visualBible}` : ''
+		}. Photorealistic live-action 35mm cinema still, natural skin texture, realistic motivated lighting, shallow depth of field, no text, no watermark`
 			.replace(/\s+/g, ' ')
 			.trim()
 			.slice(0, 950);
@@ -307,17 +349,33 @@ export function MaestroDirectorModal({
 		const ctxPlan = activePlan ?? planRef.current;
 		const freshScene = ctxPlan?.scenes.find((s) => s.id === scene.id) ?? scene;
 		let refImage = imageOverride || freshScene.imageUrl;
-		if (!refImage || !/^https?:\/\//i.test(refImage)) {
+		const hasUsableRefImage =
+			Boolean(refImage) && /^(https?:\/\/|blob:|data:image\/)/i.test(refImage);
+		if (!hasUsableRefImage) {
 			const generated = await generateSingleImage(freshScene, ctxPlan);
 			if (!generated) return null;
 			refImage = generated;
 		}
 
 		updateScene(scene.id, (s) => ({ ...s, status: 'generating_video', errorMessage: undefined }));
+		const baseMotionPrompt = (freshScene.videoMotionPrompt || freshScene.visualPrompt || '')
+			.replace(/\s+/g, ' ')
+			.trim();
+		const finalMotionPrompt =
+			`${baseMotionPrompt}. Single unbroken stabilized live-action 35mm take, natural continuous physics and breathing micro-motion, preserve exact subject face and wardrobe, no jump cuts, no flicker, no morphing`
+				.replace(/\.\s*\./g, '.')
+				.slice(0, 950);
+		const calibratedMotion = deriveRecommendedMotion(freshScene.cameraMotion, freshScene.shotType);
+
 		// Never pass song cover_url as fallback so each scene video exclusively animates its own unique reference image
-		const res = await createCreation('video', freshScene.videoMotionPrompt.slice(0, 950), {
+		const res = await createCreation('video', finalMotionPrompt, {
 			aspect: aspect === '21:9' ? '16:9' : aspect,
 			style: ctxPlan?.style || style,
+			cameraMotion: freshScene.cameraMotion,
+			motion: calibratedMotion,
+			noise_aug_strength: 0.015,
+			fps: 12,
+			num_frames: 25,
 			reference_image_url: refImage,
 			source: chosenSong
 				? {
@@ -952,8 +1010,26 @@ export function MaestroDirectorModal({
 														onChange={(e) =>
 															updateScene(sc.id, (s) => ({ ...s, visualPrompt: e.target.value }))
 														}
+														placeholder="Prompt visual de la escena (encuadre, sujeto, luz real)..."
 														className="rounded-lg border border-border bg-surface-2 p-2 text-[11px] text-muted-foreground focus:text-foreground outline-none focus:border-primary resize-none"
 													/>
+
+													{/* Video Motion Prompt (Image-to-Video direction) */}
+													<div className="flex items-center gap-2 rounded-lg border border-cyan-500/25 bg-surface-2 px-2.5 py-1">
+														<Film className="h-3.5 w-3.5 flex-none text-cyan-400" />
+														<input
+															type="text"
+															value={sc.videoMotionPrompt}
+															onChange={(e) =>
+																updateScene(sc.id, (s) => ({
+																	...s,
+																	videoMotionPrompt: e.target.value,
+																}))
+															}
+															placeholder="Dirección de movimiento suave para Video IA (sin saltos)..."
+															className="min-w-0 flex-1 bg-transparent text-[11px] text-cyan-100/85 focus:text-foreground outline-none"
+														/>
+													</div>
 
 													{sc.errorMessage && (
 														<p className="rounded bg-destructive/15 px-2 py-1 text-[11px] text-destructive">

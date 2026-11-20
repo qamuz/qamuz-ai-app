@@ -76,8 +76,16 @@ function findActiveClip(clips: NleClip[], t: number): NleClip | null {
 	const exact = clips.find((c) => t >= c.startTime && t < c.startTime + c.duration);
 	if (exact) return exact;
 	const sorted = [...clips].sort((a, b) => a.startTime - b.startTime);
+	for (let i = 0; i < sorted.length; i++) {
+		const c = sorted[i];
+		const end = c.startTime + c.duration;
+		const next = sorted[i + 1];
+		if (next && t >= end - 0.001 && t < next.startTime && next.startTime - end <= 0.08) {
+			return next;
+		}
+	}
 	const last = sorted[sorted.length - 1];
-	if (last && t >= last.startTime && t <= last.startTime + last.duration + 0.05) {
+	if (last && t >= last.startTime && t <= last.startTime + last.duration + 0.08) {
 		return last;
 	}
 	return null;
@@ -104,7 +112,7 @@ function drawVisualClip(
 ) {
 	const localT = Math.max(0, t - clip.startTime);
 	const localRatio = Math.max(0, Math.min(1, localT / Math.max(0.1, clip.duration)));
-	const transDur = Math.min(0.6, clip.duration * 0.22);
+	const transDur = Math.min(0.28, Math.max(0.14, clip.duration * 0.2));
 
 	let alpha = alphaOverride ?? clip.opacity;
 	let offsetX = 0;
@@ -115,9 +123,9 @@ function drawVisualClip(
 		} else if (clip.transitionIn === 'fade-black' && localT < transDur) {
 			alpha *= localT / transDur;
 		} else if (clip.transitionIn === 'slide-left' && localT < transDur) {
-			offsetX = (1 - localT / transDur) * width * 0.35;
+			offsetX = (1 - localT / transDur) * width * 0.25;
 		} else if (clip.transitionIn === 'zoom-in' && localT < transDur) {
-			transScale = 1.15 - 0.15 * (localT / transDur);
+			transScale = 1.08 - 0.08 * (localT / transDur);
 		}
 	}
 
@@ -128,35 +136,43 @@ function drawVisualClip(
 
 	let motionScale = transScale;
 	let panX = offsetX;
-	if (clip.cameraMotion === 'zoom-in') motionScale *= 1 + localRatio * 0.08;
-	if (clip.cameraMotion === 'zoom-out') motionScale *= 1.09 - localRatio * 0.08;
+	if (clip.cameraMotion === 'zoom-in') motionScale *= 1 + localRatio * 0.045;
+	if (clip.cameraMotion === 'zoom-out') motionScale *= 1.045 - localRatio * 0.045;
 	if (clip.cameraMotion === 'pan-left') {
-		motionScale *= 1.08;
-		panX -= localRatio * width * 0.04;
+		motionScale *= 1.04;
+		panX -= localRatio * width * 0.018;
 	}
 	if (clip.cameraMotion === 'pan-right') {
-		motionScale *= 1.08;
-		panX += localRatio * width * 0.04;
+		motionScale *= 1.04;
+		panX += localRatio * width * 0.018;
 	}
 
 	if (clip.type === 'video') {
 		const video = videoMap.get(clip.sourceUrl);
-		if (video && video.videoWidth > 0) {
+		const thumbFallback = clip.thumbnailUrl ? imageMap.get(clip.thumbnailUrl) : null;
+		if (video && video.videoWidth > 0 && video.readyState >= 2) {
 			playingVideos.add(video);
 			video.playbackRate = clip.speed;
-			video.loop = true;
 			const srcDur = Number.isFinite(video.duration) && video.duration > 0.4 ? video.duration : clip.duration;
-			const desired = (clip.trimStart + localT * clip.speed) % Math.max(0.5, srcDur);
-			// Seek only at the very start of the clip if out of phase, never thrash mid-playback
-			if (localT < 0.06 && !video.seeking && video.readyState >= 2 && Math.abs(video.currentTime - desired) > 0.25) {
+			const shouldLoop = clip.duration * clip.speed > srcDur + 0.35;
+			video.loop = shouldLoop;
+			const rawDesired = clip.trimStart + localT * clip.speed;
+			const desired = shouldLoop
+				? rawDesired % Math.max(0.5, srcDur)
+				: Math.min(rawDesired, Math.max(0, srcDur - 0.06));
+			// Only align at clip entry if far out of phase; never seek-thrash mid-cut
+			if (localT < 0.06 && !video.seeking && Math.abs(video.currentTime - desired) > 0.4) {
 				try {
 					video.currentTime = desired;
 				} catch {
 					// ignore seek error
 				}
 			}
-			if (video.paused) {
+			const nearSafeEnd = !shouldLoop && video.currentTime >= srcDur - 0.06;
+			if (!nearSafeEnd && video.paused) {
 				void video.play().catch(() => undefined);
+			} else if (nearSafeEnd && !video.paused) {
+				video.pause();
 			}
 			const vidRatio = video.videoWidth / Math.max(1, video.videoHeight);
 			const canvasRatio = width / height;
@@ -168,6 +184,18 @@ function drawVisualClip(
 				dh = dw / vidRatio;
 			}
 			ctx.drawImage(video, (width - dw) / 2 + panX, (height - dh) / 2, dw, dh);
+		} else if (thumbFallback && thumbFallback.width > 0) {
+			// Seamless poster fallback if video decoder is warming up on cut boundary
+			const imgRatio = thumbFallback.width / Math.max(1, thumbFallback.height);
+			const canvasRatio = width / height;
+			let dw = width * motionScale;
+			let dh = height * motionScale;
+			if (imgRatio > canvasRatio) {
+				dw = dh * imgRatio;
+			} else {
+				dh = dw / imgRatio;
+			}
+			ctx.drawImage(thumbFallback, (width - dw) / 2 + panX, (height - dh) / 2, dw, dh);
 		}
 	} else {
 		const img = imageMap.get(clip.sourceUrl);
@@ -235,13 +263,23 @@ export async function renderNleProject({
 	for (const track of visualTracks) {
 		for (const clip of track.clips) {
 			if (!clip.sourceUrl) continue;
-			if (clip.type === 'video' && !videoMap.has(clip.sourceUrl)) {
-				videoMap.set(clip.sourceUrl, null);
-				preloadPromises.push(
-					loadVideo(clip.sourceUrl).then((v) => {
-						videoMap.set(clip.sourceUrl, v);
-					})
-				);
+			if (clip.type === 'video') {
+				if (!videoMap.has(clip.sourceUrl)) {
+					videoMap.set(clip.sourceUrl, null);
+					preloadPromises.push(
+						loadVideo(clip.sourceUrl).then((v) => {
+							videoMap.set(clip.sourceUrl, v);
+						})
+					);
+				}
+				if (clip.thumbnailUrl && !imageMap.has(clip.thumbnailUrl)) {
+					imageMap.set(clip.thumbnailUrl, null);
+					preloadPromises.push(
+						loadImage(clip.thumbnailUrl).then((img) => {
+							imageMap.set(clip.thumbnailUrl!, img);
+						})
+					);
+				}
 			} else if (clip.type === 'image' && !imageMap.has(clip.sourceUrl)) {
 				imageMap.set(clip.sourceUrl, null);
 				preloadPromises.push(
@@ -392,7 +430,7 @@ export async function renderNleProject({
 				if (!clip) continue;
 
 				const localT = Math.max(0, t - clip.startTime);
-				const transDur = Math.min(0.6, clip.duration * 0.22);
+				const transDur = Math.min(0.28, Math.max(0.14, clip.duration * 0.2));
 				if (clip.transitionIn === 'cross-dissolve' && localT < transDur) {
 					const prevClip = findPreviousClip(vt.clips, clip);
 					if (prevClip) {
@@ -423,6 +461,17 @@ export async function renderNleProject({
 					videoMap,
 					playingVideosThisFrame
 				);
+				// Pre-warm upcoming video clip within 0.45s so decoder is hot right at the cut beat
+				const upcoming = vt.clips.find(
+					(c) => c.type === 'video' && c.startTime > t && c.startTime - t <= 0.45
+				);
+				if (upcoming) {
+					const upVid = videoMap.get(upcoming.sourceUrl);
+					if (upVid && upVid.readyState >= 2) {
+						playingVideosThisFrame.add(upVid);
+						if (upVid.paused) void upVid.play().catch(() => undefined);
+					}
+				}
 			}
 
 			// Pause inactive videos so decoders don't compete

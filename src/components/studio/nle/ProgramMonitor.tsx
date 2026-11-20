@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
 	Pause,
 	Play,
@@ -41,10 +41,19 @@ function activeClipInTrack(track: NleTrack, t: number): NleClip | null {
 		(c) => t >= c.startTime && t < c.startTime + c.duration
 	);
 	if (exact) return exact;
-	// Include final frame inclusive only at exact clip end when no next clip starts
+
+	// Bridge floating-point or tiny edit micro-gaps (<= 0.08s) so cuts never drop to black
 	const sorted = [...track.clips].sort((a, b) => a.startTime - b.startTime);
+	for (let i = 0; i < sorted.length; i++) {
+		const c = sorted[i];
+		const end = c.startTime + c.duration;
+		const next = sorted[i + 1];
+		if (next && t >= end - 0.001 && t < next.startTime && next.startTime - end <= 0.08) {
+			return next;
+		}
+	}
 	const last = sorted[sorted.length - 1];
-	if (last && t >= last.startTime && t <= last.startTime + last.duration + 0.04) {
+	if (last && t >= last.startTime && t <= last.startTime + last.duration + 0.08) {
 		return last;
 	}
 	return null;
@@ -58,9 +67,9 @@ function findPreviousClipInTrack(track: NleTrack, current: NleClip): NleClip | n
 	);
 }
 
-function findUpcomingClipsInTrack(track: NleTrack, t: number, count = 2): NleClip[] {
+function findUpcomingClipsInTrack(track: NleTrack, t: number, count = 3): NleClip[] {
 	return track.clips
-		.filter((c) => c.startTime > t && c.startTime - t <= 8)
+		.filter((c) => c.startTime > t && c.startTime - t <= 10)
 		.sort((a, b) => a.startTime - b.startTime)
 		.slice(0, count);
 }
@@ -68,23 +77,23 @@ function findUpcomingClipsInTrack(track: NleTrack, t: number, count = 2): NleCli
 function getMotionTransform(clip: NleClip, t: number): string {
 	const ratio = Math.max(0, Math.min(1, (t - clip.startTime) / Math.max(0.1, clip.duration)));
 	if (clip.cameraMotion === 'zoom-in') {
-		return `translate3d(0, 0, 0) scale(${(1 + ratio * 0.08).toFixed(4)})`;
+		return `translate3d(0, 0, 0) scale(${(1 + ratio * 0.045).toFixed(4)})`;
 	}
 	if (clip.cameraMotion === 'zoom-out') {
-		return `translate3d(0, 0, 0) scale(${(1.09 - ratio * 0.08).toFixed(4)})`;
+		return `translate3d(0, 0, 0) scale(${(1.045 - ratio * 0.045).toFixed(4)})`;
 	}
 	if (clip.cameraMotion === 'pan-left') {
-		return `translate3d(${(-ratio * 3).toFixed(3)}%, 0, 0) scale(1.08)`;
+		return `translate3d(${(-ratio * 1.8).toFixed(3)}%, 0, 0) scale(1.04)`;
 	}
 	if (clip.cameraMotion === 'pan-right') {
-		return `translate3d(${(ratio * 3).toFixed(3)}%, 0, 0) scale(1.08)`;
+		return `translate3d(${(ratio * 1.8).toFixed(3)}%, 0, 0) scale(1.04)`;
 	}
 	return 'translate3d(0, 0, 0) scale(1)';
 }
 
 function getTransitionOpacity(clip: NleClip, t: number, hasOutgoingUnderlay: boolean): number {
 	const localT = Math.max(0, t - clip.startTime);
-	const transDur = Math.min(0.35, clip.duration * 0.22);
+	const transDur = Math.min(0.28, Math.max(0.14, clip.duration * 0.2));
 	if (clip.transitionIn === 'fade-black' && transDur > 0.05 && localT < transDur) {
 		return clip.opacity * Math.max(0, localT / transDur);
 	}
@@ -121,8 +130,26 @@ function VisualLayer({
 	const lastSeekVersionRef = useRef(seekVersion);
 	const prevModeRef = useRef<string>(mode);
 	const needsInitialSyncRef = useRef<boolean>(true);
+	const [videoFrameReady, setVideoFrameReady] = useState(false);
 	const effLut = clip.lutId !== 'inherit' ? clip.lutId : fx.lutId;
 	const filter = buildCssFilter(effLut, clip.colorAdjust);
+
+	// Reset ready flag only if the underlying video URL changes
+	useEffect(() => {
+		setVideoFrameReady(false);
+	}, [clip.sourceUrl]);
+
+	// Pre-decode thumbnail/image into GPU bitmap cache to eliminate first-frame paint flicker
+	useEffect(() => {
+		const url = clip.type === 'video' ? clip.thumbnailUrl : clip.sourceUrl;
+		if (!url) return;
+		const img = new Image();
+		img.decoding = 'async';
+		img.src = url;
+		if (typeof img.decode === 'function') {
+			void img.decode().catch(() => undefined);
+		}
+	}, [clip.type, clip.sourceUrl, clip.thumbnailUrl]);
 
 	const clampedTime =
 		mode === 'outgoing'
@@ -144,19 +171,29 @@ function VisualLayer({
 		vid.muted = mode === 'preload' || masterMuted || trackMuted || clip.volume === 0;
 		vid.volume = Math.max(0, Math.min(1, clip.volume * trackVolume));
 		vid.playbackRate = clip.speed;
-		vid.loop = true;
+
+		const dur = Number.isFinite(vid.duration) && vid.duration > 0.4 ? vid.duration : 0;
+		// Avoid snapping short (~2s) SVD videos back to frame 0 mid-cut: only loop when the clip is much longer than the source file.
+		const shouldLoop = dur > 0 ? clip.duration * clip.speed > dur + 0.35 : false;
+		vid.loop = shouldLoop;
+
+		if (vid.readyState >= 2 && !vid.seeking) {
+			setVideoFrameReady(true);
+		}
 
 		const userSeeked = lastSeekVersionRef.current !== seekVersion;
 		lastSeekVersionRef.current = seekVersion;
+		const wasPreload = prevModeRef.current === 'preload';
 		const justBecameActive = prevModeRef.current !== 'active' && mode === 'active';
 		prevModeRef.current = mode;
 
-		if (userSeeked || justBecameActive) {
+		if (userSeeked || (justBecameActive && !wasPreload)) {
 			needsInitialSyncRef.current = true;
 		}
 
 		if (mode === 'preload') {
 			if (!vid.paused) vid.pause();
+			// Position preloaded video cleanly at trimStart ahead of the cut so activation needs ZERO seek!
 			if (!vid.seeking && vid.readyState >= 1 && Math.abs(vid.currentTime - clip.trimStart) > 0.08) {
 				try {
 					vid.currentTime = clip.trimStart;
@@ -168,15 +205,24 @@ function VisualLayer({
 		}
 
 		const rawOffset = Math.max(0, clip.trimStart + (clampedTime - clip.startTime) * clip.speed);
-		const dur = Number.isFinite(vid.duration) && vid.duration > 0.4 ? vid.duration : 0;
-		const srcTarget = dur > 0 ? rawOffset % dur : rawOffset;
+		const srcTarget =
+			dur > 0
+				? shouldLoop
+					? rawOffset % dur
+					: Math.min(rawOffset, Math.max(0, dur - 0.06))
+				: rawOffset;
 
-		// Seek ONLY when paused, user explicitly scrubbed, or on first activation before playback settles.
-		// Never re-seek mid-playback: re-seeking is what causes black decoder flashes!
-		const shouldSyncTime = !isPlaying || userSeeked || needsInitialSyncRef.current;
+		// Seek ONLY when paused, user explicitly scrubbed, or on first un-preloaded activation.
+		// When handing off from 'preload' -> 'active' while playing, avoid seeking within 0.45s
+		// so the hardware video decoder never flushes its frame buffer and flashes black!
+		const drift = Math.abs(vid.currentTime - srcTarget);
+		const shouldSyncTime =
+			!isPlaying ||
+			userSeeked ||
+			(needsInitialSyncRef.current && (!wasPreload || drift > 0.45));
 
 		if (shouldSyncTime && !vid.seeking && vid.readyState >= 1) {
-			if (Math.abs(vid.currentTime - srcTarget) > 0.08) {
+			if (drift > 0.08) {
 				try {
 					vid.currentTime = srcTarget;
 				} catch {
@@ -184,11 +230,14 @@ function VisualLayer({
 				}
 			}
 			needsInitialSyncRef.current = false;
+		} else if (wasPreload && justBecameActive) {
+			needsInitialSyncRef.current = false;
 		}
 
-		if (mode === 'active' && isPlaying && vid.paused) {
+		const nearSafeEnd = !shouldLoop && dur > 0 && vid.currentTime >= dur - 0.06;
+		if (mode === 'active' && isPlaying && !nearSafeEnd && vid.paused) {
 			void vid.play().catch(() => undefined);
-		} else if ((!isPlaying || mode === 'outgoing') && !vid.paused) {
+		} else if ((!isPlaying || mode === 'outgoing' || nearSafeEnd) && !vid.paused) {
 			vid.pause();
 		}
 	}, [clip, clampedTime, isPlaying, masterMuted, trackMuted, trackVolume, seekVersion, mode]);
@@ -197,6 +246,10 @@ function VisualLayer({
 	const filterStyle = filter !== 'none' ? filter : undefined;
 
 	if (clip.type === 'video' && clip.sourceUrl) {
+		const markReady = () => {
+			const v = videoRef.current;
+			if (v && v.readyState >= 2) setVideoFrameReady(true);
+		};
 		return (
 			<div
 				aria-hidden={mode === 'preload'}
@@ -215,10 +268,17 @@ function VisualLayer({
 				<video
 					ref={videoRef}
 					src={clip.sourceUrl}
-					loop
 					playsInline
 					preload="auto"
-					style={{ filter: filterStyle, transform }}
+					onLoadedData={markReady}
+					onCanPlay={markReady}
+					onPlaying={markReady}
+					onSeeked={markReady}
+					style={{
+						filter: filterStyle,
+						transform,
+						opacity: videoFrameReady ? 1 : 0,
+					}}
 					className="absolute inset-0 h-full w-full object-cover will-change-transform"
 				/>
 			</div>
@@ -285,11 +345,15 @@ export function ProgramMonitor({
 			if (active) {
 				topActive = active;
 				const localT = Math.max(0, playhead - active.startTime);
-				const transDur = Math.min(0.35, active.duration * 0.22);
-				const prevClip =
-					active.transitionIn === 'cross-dissolve' && localT < transDur
-						? findPreviousClipInTrack(track, active)
-						: null;
+				const transDur = Math.min(0.28, Math.max(0.14, active.duration * 0.2));
+				// Keep previous clip as a solid underlay during cross-dissolve AND for the first 180ms
+				// of any hard cut so the viewport NEVER flashes black while the incoming clip paints.
+				const needsOutgoingUnderlay =
+					(active.transitionIn === 'cross-dissolve' && localT < transDur) ||
+					(active.transitionIn !== 'fade-black' && localT < 0.18);
+				const prevClip = needsOutgoingUnderlay
+					? findPreviousClipInTrack(track, active)
+					: null;
 
 				if (prevClip) {
 					layers.push({
@@ -309,7 +373,7 @@ export function ProgramMonitor({
 				});
 			}
 
-			const upcoming = findUpcomingClipsInTrack(track, playhead, 2);
+			const upcoming = findUpcomingClipsInTrack(track, playhead, 3);
 			for (const up of upcoming) {
 				if (layers.some((l) => l.key === `${track.id}-${up.id}`)) continue;
 				layers.push({

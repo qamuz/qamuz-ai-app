@@ -1,4 +1,5 @@
 import { analyzeAudioTrack, type AudioAnalysisResult } from '@/lib/nle/audioAnalyzer';
+import { getAuthHeaders } from '@/lib/safeUrl';
 import type { StudioSong } from '@/lib/studio';
 
 export type MaestroFormat = 'music-video' | 'short-film' | 'mini-series' | 'commercial-promo';
@@ -66,21 +67,36 @@ async function localBlobToBase64(url: string): Promise<{ base64: string; mime: s
 	}
 }
 
-export async function magicEnhancePrompt(
+export interface MagicEnhanceOptions {
+	mode?: 'enhance-prompt' | 'cover-prompt' | 'video-prompt';
+	style?: string;
+	character?: string;
+	format?: MaestroFormat;
+	songTitle?: string;
+	sceneContext?: string;
+	provider?: 'auto' | 'modal' | 'gemini';
+	previousVideos?: string[];
+	visualBible?: string;
+	previousScenePrompt?: string;
+	nextScenePrompt?: string;
+	cameraMotion?: string;
+	hasStartImage?: boolean;
+}
+
+export interface MagicEnhanceResult {
+	prompt: string;
+	recommendedMotion?: number;
+	continuityNote?: string;
+}
+
+export async function magicEnhancePromptDetailed(
 	rawText: string,
-	options: {
-		mode?: 'enhance-prompt' | 'cover-prompt' | 'video-prompt';
-		style?: string;
-		character?: string;
-		format?: MaestroFormat;
-		songTitle?: string;
-		sceneContext?: string;
-		provider?: 'auto' | 'modal' | 'gemini';
-	} = {}
-): Promise<string> {
+	options: MagicEnhanceOptions = {}
+): Promise<MagicEnhanceResult> {
+	const headers = await getAuthHeaders({ 'Content-Type': 'application/json' });
 	const res = await fetch('/api/ai/magic-wand', {
 		method: 'POST',
-		headers: { 'Content-Type': 'application/json' },
+		headers,
 		body: JSON.stringify({
 			mode: options.mode || 'enhance-prompt',
 			text: rawText,
@@ -90,13 +106,39 @@ export async function magicEnhancePrompt(
 			songTitle: options.songTitle || '',
 			sceneContext: options.sceneContext || '',
 			provider: options.provider || 'auto',
+			previousVideos: options.previousVideos ?? [],
+			visualBible: options.visualBible || '',
+			previousScenePrompt: options.previousScenePrompt || '',
+			nextScenePrompt: options.nextScenePrompt || '',
+			cameraMotion: options.cameraMotion || '',
+			hasStartImage: Boolean(options.hasStartImage),
 		}),
 	});
-	const data = (await res.json().catch(() => ({}))) as { result?: string; error?: string };
+	const data = (await res.json().catch(() => ({}))) as {
+		result?: string;
+		recommendedMotion?: number;
+		continuityNote?: string;
+		error?: string;
+	};
 	if (!res.ok || !data.result) {
 		throw new Error(data.error || 'No se pudo conectar con el Prompter IA.');
 	}
-	return data.result.slice(0, 920);
+	return {
+		prompt: data.result.slice(0, 920),
+		recommendedMotion:
+			typeof data.recommendedMotion === 'number' && Number.isFinite(data.recommendedMotion)
+				? data.recommendedMotion
+				: undefined,
+		continuityNote: typeof data.continuityNote === 'string' ? data.continuityNote : undefined,
+	};
+}
+
+export async function magicEnhancePrompt(
+	rawText: string,
+	options: MagicEnhanceOptions = {}
+): Promise<string> {
+	const detailed = await magicEnhancePromptDetailed(rawText, options);
+	return detailed.prompt;
 }
 
 export async function magicExpandStoryIdea(
@@ -105,9 +147,10 @@ export async function magicExpandStoryIdea(
 	format: MaestroFormat,
 	options: { style?: string; character?: string; lyrics?: string } = {}
 ): Promise<string> {
+	const headers = await getAuthHeaders({ 'Content-Type': 'application/json' });
 	const res = await fetch('/api/ai/magic-wand', {
 		method: 'POST',
-		headers: { 'Content-Type': 'application/json' },
+		headers,
 		body: JSON.stringify({
 			mode: 'expand-story',
 			text: idea,
@@ -130,9 +173,10 @@ export async function generateYoutubeSeo(payload: {
 	style: string;
 	sceneContext: string;
 }): Promise<{ title: string; description: string; tags: string }> {
+	const headers = await getAuthHeaders({ 'Content-Type': 'application/json' });
 	const res = await fetch('/api/ai/magic-wand', {
 		method: 'POST',
-		headers: { 'Content-Type': 'application/json' },
+		headers,
 		body: JSON.stringify({
 			mode: 'youtube-seo',
 			songTitle: payload.songTitle,
@@ -160,9 +204,10 @@ export async function transcribeAndSyncLyrics(payload: {
 	cues: { startTime: number; endTime: number; text: string; isSlogan: boolean }[];
 }> {
 	const blobAudio = await localBlobToBase64(payload.audioUrl);
+	const headers = await getAuthHeaders({ 'Content-Type': 'application/json' });
 	const res = await fetch('/api/ai/transcribe-sync', {
 		method: 'POST',
-		headers: { 'Content-Type': 'application/json' },
+		headers,
 		body: JSON.stringify({
 			audioUrl: payload.audioUrl.startsWith('http') ? payload.audioUrl : '',
 			audioBase64: blobAudio?.base64 || '',
@@ -228,9 +273,10 @@ export async function buildMaestroDirectorPlan({
 
 	const blobAudio = effectiveUrl ? await localBlobToBase64(effectiveUrl) : null;
 
+	const headers = await getAuthHeaders({ 'Content-Type': 'application/json' });
 	const response = await fetch('/api/ai/director-plan', {
 		method: 'POST',
-		headers: { 'Content-Type': 'application/json' },
+		headers,
 		body: JSON.stringify({
 			audioUrl: effectiveUrl.startsWith('http') ? effectiveUrl : '',
 			audioBase64: blobAudio?.base64 || '',
